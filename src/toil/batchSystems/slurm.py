@@ -19,6 +19,7 @@ from pipes import quote
 import subprocess
 import time
 import math
+import sys
 
 # Python 3 compatibility imports
 from six.moves.queue import Empty, Queue
@@ -40,7 +41,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # currentjobs is a dictionary that maps a slurm job id (string) to our own internal job id
             # squeue arguments:
             # -h for no header
-            # --format to get jobid i, state %t and time days-hours:minutes:seconds
+            # --format to get jobid (%i), state (%t) and time (%M) days-hours:minutes:seconds
 
             lines = subprocess.check_output(['squeue', '-h', '--format', '%i %t %M']).split('\n')
             for line in lines:
@@ -58,7 +59,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             subprocess.check_call(['scancel', self.getBatchSystemID(jobID)])
 
         def prepareSubmission(self, cpu, memory, jobID, command):
-            return self.prepareSbatch(cpu, memory, jobID) + ['--wrap={}'.format(command)]
+            return self.prepareSbatch(cpu, memory, jobID) + ['--wrap="{}"'.format(command)]
 
         def submitJob(self, subLine):
             try:
@@ -95,8 +96,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     '-n', # no header
                     '-j', str(slurmJobID), # job
                     '--format', 'State,ExitCode', # specify output columns
-                    '-P', # separate columns with pipes
-                    '-S', '1970-01-01'] # override start time limit
+                    '-P'] # separate columns with pipes
             
             process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             rc = process.returncode
@@ -214,7 +214,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
     @classmethod
     def getWaitDuration(cls):
-        return 1.0
+        return 10
 
     @classmethod
     def obtainSystemConstants(cls):
