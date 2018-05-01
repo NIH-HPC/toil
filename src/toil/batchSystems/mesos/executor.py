@@ -13,16 +13,24 @@
 # limitations under the License.
 
 from __future__ import absolute_import
+from future import standard_library
+standard_library.install_aliases()
+from builtins import str
 import os
 import random
 import socket
+import signal
 import sys
 import threading
-import pickle
 import logging
-import subprocess
+from toil import subprocess
 import traceback
 from time import sleep, time
+
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 
 import psutil
 import mesos.interface
@@ -78,16 +86,20 @@ class MesosExecutor(mesos.interface.Executor):
         log.critical("Disconnected from slave")
 
     def killTask(self, driver, taskId):
+        """
+        Kill parent task process and all its spawned children
+        """
         try:
             pid = self.runningTasks[taskId]
+            pgid = os.getpgid(pid)
         except KeyError:
             pass
         else:
-            os.kill(pid, 9)
+            os.killpg(pgid, signal.SIGKILL)
 
     def shutdown(self, driver):
         log.critical('Shutting down executor ...')
-        for taskId in self.runningTasks.keys():
+        for taskId in list(self.runningTasks.keys()):
             self.killTask(driver, taskId)
         Resource.cleanSystem()
         BatchSystemSupport.workerCleanup(self.workerCleanupInfo)
@@ -176,6 +188,7 @@ class MesosExecutor(mesos.interface.Executor):
             log.debug("Invoking command: '%s'", job.command)
             with self.popenLock:
                 return subprocess.Popen(job.command,
+                                        preexec_fn=lambda: os.setpgrp(),
                                         shell=True, env=dict(os.environ, **job.environment))
 
         def sendUpdate(taskState, wallTime=None, message=''):

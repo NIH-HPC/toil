@@ -13,16 +13,18 @@
 # limitations under the License.
 
 from __future__ import absolute_import
+from builtins import range
 import os
 
 # Python 3 compatibility imports
 from six.moves import xrange
 
 from toil.job import Job
-from toil.test import ToilTest
+from toil.test import ToilTest, slow
 from toil.jobStores.abstractJobStore import NoSuchFileException
 from toil.leader import FailedJobsException
 
+@slow
 class ResumabilityTest(ToilTest):
     """
     https://github.com/BD2KGenomics/toil/issues/808
@@ -33,6 +35,7 @@ class ResumabilityTest(ToilTest):
         """
         options = Job.Runner.getDefaultOptions(self._getTestJobStorePath())
         options.logLevel = "INFO"
+        options.retryCount = 0
         root = Job.wrapJobFn(parent)
         with self.assertRaises(FailedJobsException):
             # This one is intended to fail.
@@ -59,7 +62,7 @@ def parent(job):
     Set up a bunch of dummy child jobs, and a bad job that needs to be
     restarted as the follow on.
     """
-    for _ in xrange(5):
+    for _ in range(5):
         job.addChildJobFn(goodChild)
     job.addFollowOnJobFn(badChild)
 

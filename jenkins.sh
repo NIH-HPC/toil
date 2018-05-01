@@ -12,13 +12,25 @@ virtualenv --system-site-packages --never-download venv
 make prepare
 
 # Install Toil and its runtime requirements
-make develop extras=[aws,mesos,azure,encryption,cwl]
+make develop extras=[aws,mesos,azure,google,encryption,cwl,htcondor]
 
 # Required for running Mesos master and slave daemons as part of the tests
 export LIBPROCESS_IP=127.0.0.1
 
 # Needed for integrative provisioner tests
 export CGCLOUD_ME=jenkins@jenkins-master
+export TOIL_AWS_KEYNAME=jenkins@jenkins-master
+export TOIL_AZURE_KEYNAME=toiltest
+export TOIL_AZURE_ZONE=westus
+export PUBLIC_KEY_FILE=/home/jenkins/builds/.ssh/id_rsa.pub
+export TOIL_SSH_KEYNAME=jenkins
+export TOIL_GOOGLE_PROJECTID=toil-dev
+export GOOGLE_APPLICATION_CREDENTIALS=/home/jenkins/builds/toil-dev-41fd0135b44d.json
+export TOIL_BOTO_DIR=/home/jenkins/.boto
+
+# Needed for google provisioner tests
+export TOIL_GOOGLE_KEYNAME=jenkins
+export TOIL_BOTO_DIR=/home/jenkins/.boto
 
 TMPDIR=/mnt/ephemeral/tmp
 # Run rm "as root" so we can clean up files left over by rogue containers

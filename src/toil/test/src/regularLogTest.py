@@ -1,3 +1,4 @@
+from __future__ import print_function
 # Copyright (C) 2015-2016 Regents of the University of California
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import mimetypes
-import subprocess
 import sys
 import os
 
-from toil.test import ToilTest
+from toil import subprocess
+from toil.test import ToilTest, slow
 from toil.test.mesos import helloWorld
 
 
@@ -45,6 +46,7 @@ class RegularLogTest(ToilTest):
                     self.assertEqual(mime[1], encoding)
 
 
+    @slow
     def testLogToMaster(self):
         toilOutput = subprocess.check_output([sys.executable,
                                               '-m', helloWorld.__name__,
@@ -63,6 +65,7 @@ class RegularLogTest(ToilTest):
                                              stderr=subprocess.STDOUT)
         self._assertFileTypeExists(self.tempDir, '.log')
 
+    @slow
     def testWriteGzipLogs(self):
         toilOutput = subprocess.check_output([sys.executable,
                                               '-m', helloWorld.__name__,
@@ -73,6 +76,7 @@ class RegularLogTest(ToilTest):
                                               stderr=subprocess.STDOUT)
         self._assertFileTypeExists(self.tempDir, '.log.gz', 'gzip')
 
+    @slow
     def testMultipleLogToMaster(self):
         toilOutput = subprocess.check_output([sys.executable,
                                               '-m', helloWorld.__name__,

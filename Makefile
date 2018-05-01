@@ -1,4 +1,4 @@
-# Copyright (C) 2015 UCSC Computational Genomics Lab
+# Copyright (C) 2015-2018 UCSC Computational Genomics Lab
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ immediately affect the virtualenv. Set the 'extras' variable to ensure that the 
 installs support for extras. Consult setup.py for the list of supported extras. To install Toil
 in develop mode with all extras, run
 
-	make develop extras=[mesos,aws,google,azure,cwl,encryption]
+	make develop extras=[all]
 
 The 'sdist' target creates a source distribution of Toil. It is used for some unit tests and for
 installing the currently checked out version of Toil into the appliance image.
@@ -37,12 +37,25 @@ uploaded to PyPI.
 
 The 'docs' target uses Sphinx to create HTML documentation in the docs/_build directory
 
-The 'test' target runs Toil's unit tests serially with pytest.
+The 'test' target runs Toil's unit tests serially with pytest. It will run some docker tests and
+setup. If you wish to avoid this, use the 'test_offline' target instead. Note: this target does not
+capture output from the terminal. For any of the test targets, set the 'tests' variable to run a
+particular test, e.g.
 
-The 'test_parallel' target runs Toil's unit tests in parallel and generates a test report
-from the results. Set the 'tests' variable to run a particular test, e.g.
+	make test tests=src/toil/test/sort/sortTest.py::SortTest::testSort
 
-	make test_parallel tests=src/toil/test/sort/sortTest.py::SortTest::testSort
+The 'test_offline' target is similar to 'test' but it skips the docker dependent tests and their
+setup.
+
+The 'integration_test_local' target runs toil's integration tests. These are more thorough but also
+more costly than the regular unit tests. For the AWS integration tests to run, the environment
+variable 'TOIL_AWS_KEYNAME' must be set. This user will be charged for expenses acrued during the
+test. This test does not capture terminal output.
+
+The 'integration_test' target is the same as the previous except that it does capture output.
+
+The 'test_parallel' target runs Toil's unit tests in parallel and generates an XML test report
+from the results. It is designed to be used only in Jenkins.
 
 The 'pypi' target publishes the current commit of Toil to PyPI after enforcing that the working
 copy and the index are clean.
@@ -61,7 +74,7 @@ requires the TOIL_DOCKER_REGISTRY variable to be set to a value other than the d
 accidentally pushing to the official Docker registry for Toil.
 
 The TOIL_DOCKER_NAME environment variable can be set to customize the appliance image name that
-is created by the 'docker' target and pushed by the 'push_docker' target. The Toil team's
+is created by the 'docker' target and pushed by the 'push_docker' target. The Toil team\'s
 continuous integration system overrides this variable to avoid conflicts between concurrently
 executing builds for the same revision, e.g. toil-pr and toil-it.
 
@@ -75,6 +88,9 @@ SHELL=bash
 python=python2.7
 pip=pip2.7
 tests=src
+tests_local=src/toil/test
+# do slightly less than travis timeout of 10 min.
+pytest_args_local=-vv --timeout=530
 extras=
 
 dist_version:=$(shell $(python) version_template.py distVersion)
@@ -83,19 +99,13 @@ sdist_name:=toil-$(dist_version).tar.gz
 docker_tag:=$(shell $(python) version_template.py dockerTag)
 default_docker_registry:=$(shell $(python) version_template.py dockerRegistry)
 docker_path:=$(strip $(shell which docker))
-ifdef docker_path
-    ifdef docker_registry
-        export TOIL_DOCKER_REGISTRY?=$(docker_registry)
-    else
-        export TOIL_DOCKER_REGISTRY?=$(default_docker_registry)
-    endif
+
+ifdef docker_registry
+    export TOIL_DOCKER_REGISTRY?=$(docker_registry)
 else
-    $(warning Cannot find 'docker' executable. Docker-related targets will be skipped.)
-    export TOIL_DOCKER_REGISTRY:=
+    export TOIL_DOCKER_REGISTRY?=$(default_docker_registry)
 endif
 export TOIL_DOCKER_NAME?=$(shell $(python) version_template.py dockerName)
-# Note that setting TOIL_DOCKER_REGISTRY to an empty string yields an invalid TOIL_APPLIANCE_SELF
-# which will coax the @needs_appliance decorator to skip the test.
 export TOIL_APPLIANCE_SELF:=$(TOIL_DOCKER_REGISTRY)/$(TOIL_DOCKER_NAME):$(docker_tag)
 
 ifndef BUILD_NUMBER
@@ -104,7 +114,6 @@ normal=\033[0m
 red=\033[0;31m
 cyan=\033[0;36m
 endif
-
 
 develop: check_venv
 	$(pip) install -e .$(extras)
@@ -128,20 +137,39 @@ clean_sdist:
 	- rm src/toil/version.py
 
 
+# This target will skip building docker and all docker based tests
+test_offline: check_venv check_build_reqs
+	@printf "$(cyan)All docker related tests will be skipped.$(normal)\n"
+	TOIL_SKIP_DOCKER=True \
+		$(python) -m pytest $(pytest_args_local) $(tests_local)
+
+# The auto-deployment test needs the docker appliance
 test: check_venv check_build_reqs docker
 	TOIL_APPLIANCE_SELF=$(docker_registry)/$(docker_base_name):$(docker_tag) \
-	    $(python) -m pytest -vv $(tests)
+	    $(python) -m pytest $(pytest_args_local) $(tests)
 
+# For running integration tests locally in series (uses the -s argument for pyTest)
+integration_test_local: check_venv check_build_reqs sdist push_docker
+	TOIL_TEST_INTEGRATIVE=True \
+		$(python) run_tests.py --local integration-test $(tests)
 
-test_parallel: check_venv check_build_reqs docker
+# These two targets are for backwards compatibility but will be removed shortly
+# FIXME when they are removed add check_running_on_jenkins to the jenkins targets
+test_parallel: jenkins_test_parallel
+
+integration_test: jenkins_test_integration
+
+# This target is designed only for use on Jenkins
+jenkins_test_parallel: check_venv check_build_reqs docker
 	$(python) run_tests.py test $(tests)
 
-
-integration_test: check_venv check_build_reqs sdist push_docker
+# This target is designed only for use on Jenkins
+jenkins_test_integration: check_venv check_build_reqs sdist push_docker
 	TOIL_TEST_INTEGRATIVE=True $(python) run_tests.py integration-test $(tests)
 
 
 pypi: check_venv check_clean_working_copy check_running_on_jenkins
+	$(pip) install setuptools --upgrade
 	$(python) setup.py egg_info sdist bdist_egg upload
 clean_pypi:
 	- rm -rf build/
@@ -152,6 +180,10 @@ ifdef TOIL_DOCKER_REGISTRY
 docker_image:=$(TOIL_DOCKER_REGISTRY)/$(TOIL_DOCKER_NAME)
 docker_short_tag:=$(shell $(python) version_template.py dockerShortTag)
 docker_minimal_tag:=$(shell $(python) version_template.py dockerMinimalTag)
+
+grafana_image:=$(TOIL_DOCKER_REGISTRY)/toil-grafana
+prometheus_image:=$(TOIL_DOCKER_REGISTRY)/toil-prometheus
+mtail_image:=$(TOIL_DOCKER_REGISTRY)/toil-mtail
 
 define tag_docker
 	@printf "$(cyan)Removing old tag $2. This may fail but that's expected.$(normal)\n"
@@ -165,6 +197,19 @@ docker: docker/Dockerfile
 	@set -ex \
 	; cd docker \
 	; docker build --tag=$(docker_image):$(docker_tag) -f Dockerfile .
+
+	@set -ex \
+	; cd dashboard/prometheus \
+	; docker build --tag=$(prometheus_image):$(docker_tag) -f Dockerfile .
+
+	@set -ex \
+	; cd dashboard/grafana \
+	; docker build --tag=$(grafana_image):$(docker_tag) -f Dockerfile .
+
+	@set -ex \
+	; cd dashboard/mtail \
+	; docker build --tag=$(mtail_image):$(docker_tag) -f Dockerfile .
+
 ifdef BUILD_NUMBER
 	$(call tag_docker,$(docker_image):$(docker_tag),$(docker_image):$(docker_short_tag))
 	$(call tag_docker,$(docker_image):$(docker_tag),$(docker_image):$(docker_minimal_tag))
@@ -188,7 +233,10 @@ obliterate_docker: clean_docker
 	-docker images -qf dangling=true | xargs docker rmi
 
 push_docker: docker check_docker_registry
-	docker push $(docker_image):$(docker_tag)
+	for i in $$(seq 1 5); do docker push $(docker_image):$(docker_tag) && break || sleep 60; done
+	for i in $$(seq 1 5); do docker push $(grafana_image):$(docker_tag) && break || sleep 60; done
+	for i in $$(seq 1 5); do docker push $(prometheus_image):$(docker_tag) && break || sleep 60; done
+	for i in $$(seq 1 5); do docker push $(mtail_image):$(docker_tag) && break || sleep 60; done
 
 else
 
@@ -214,11 +262,12 @@ check_build_reqs:
 
 
 prepare: check_venv
-	$(pip) install sphinx==1.5.5 mock==1.0.1 pytest==2.8.3 stubserver==1.0.1
+	$(pip) install sphinx==1.5.5 mock==1.0.1 pytest==2.8.3 stubserver==1.0.1 \
+		pytest-timeout==1.2.0
 
 
 check_venv:
-	@$(python) -c 'import sys; sys.exit( int( not hasattr(sys, "real_prefix") ) )' \
+	@$(python) -c 'import sys; sys.exit( int( not (hasattr(sys, "real_prefix") or ( hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix ) ) ) )' \
 		|| ( printf "$(red)A virtualenv must be active.$(normal)\n" ; false )
 
 
@@ -229,7 +278,7 @@ check_clean_working_copy:
 	@git diff --cached --exit-code > /dev/null \
 		|| ( printf "$(red)Your index looks dirty.$(normal)\n" ; false )
 	@test -z "$$(git ls-files --other --exclude-standard --directory)" \
-		|| ( printf "$(red)You have are untracked files:$(normal)\n" \
+		|| ( printf "$(red)You have untracked files:$(normal)\n" \
 			; git ls-files --other --exclude-standard --directory \
 			; false )
 
@@ -246,17 +295,20 @@ check_docker_registry:
 	$(default_docker_registry) and ensure that you have permissions to push \
 	to that registry. Only CI builds should push to $(default_docker_registry).$(normal)\n' ; false )
 
+
 check_cpickle:
 	# fail if cPickle.dump(s) called without HIGHEST_PROTOCOL
 	# https://github.com/BD2KGenomics/toil/issues/1503
-	! find . -iname '*.py' | xargs grep 'cPickle.dump' | grep --invert-match HIGHEST_PROTOCOL
+	! find src -iname '*.py' | xargs grep 'cPickle.dump' | grep --invert-match HIGHEST_PROTOCOL
+
 
 .PHONY: help \
 		prepare \
 		check_cpickle \
 		develop clean_develop \
 		sdist clean_sdist \
-		test \
+		test test_offline test_parallel integration_test \
+		jenkins_test_parallel jenkins_test_integration \
 		pypi clean_pypi \
 		docs clean_docs \
 		clean \

@@ -13,10 +13,15 @@
 # limitations under the License.
 
 from __future__ import absolute_import
+from __future__ import division
+from builtins import map
+from builtins import str
+from builtins import range
+from past.utils import old_div
 import logging
 import os
 from pipes import quote
-import subprocess
+from toil import subprocess
 import time
 import math
 
@@ -38,7 +43,8 @@ class GridEngineBatchSystem(AbstractGridEngineBatchSystem):
         """
         def getRunningJobIDs(self):
             times = {}
-            currentjobs = dict((str(self.batchJobIDs[x][0]), x) for x in self.runningJobs)
+            with self.runningJobsLock:
+                currentjobs = dict((str(self.batchJobIDs[x][0]), x) for x in self.runningJobs)
             process = subprocess.Popen(["qstat"], stdout=subprocess.PIPE)
             stdout, stderr = process.communicate()
 
@@ -60,7 +66,7 @@ class GridEngineBatchSystem(AbstractGridEngineBatchSystem):
 
         def submitJob(self, subLine):
             process = subprocess.Popen(subLine, stdout=subprocess.PIPE)
-            result = int(process.stdout.readline().strip().split('.')[0])
+            result = int(process.stdout.readline().strip())
             return result
 
         def getJobExitCode(self, sgeJobID):
@@ -94,11 +100,11 @@ class GridEngineBatchSystem(AbstractGridEngineBatchSystem):
             if self.boss.environment:
                 qsubline.append('-v')
                 qsubline.append(','.join(k + '=' + quote(os.environ[k] if v is None else v)
-                                         for k, v in self.boss.environment.iteritems()))
+                                         for k, v in self.boss.environment.items()))
 
             reqline = list()
             if mem is not None:
-                memStr = str(mem / 1024) + 'K'
+                memStr = str(old_div(mem, 1024)) + 'K'
                 reqline += ['vf=' + memStr, 'h_vmem=' + memStr]
             if len(reqline) > 0:
                 qsubline.extend(['-hard', '-l', ','.join(reqline)])
@@ -124,7 +130,9 @@ class GridEngineBatchSystem(AbstractGridEngineBatchSystem):
 
     @classmethod
     def obtainSystemConstants(cls):
-        lines = filter(None, map(str.strip, subprocess.check_output(["qhost"]).split('\n')))
+        def byteStrip(s):
+            return s.encode().strip()
+        lines = [_f for _f in map(byteStrip, subprocess.check_output(["qhost"]).split('\n')) if _f]
         line = lines[0]
         items = line.strip().split()
         num_columns = len(items)

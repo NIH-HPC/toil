@@ -14,35 +14,44 @@
 
 from __future__ import absolute_import, print_function
 
+from future import standard_library
+standard_library.install_aliases()
+from builtins import zip
+from builtins import map
+from builtins import str
+from builtins import object
 import collections
 import importlib
 import inspect
 import logging
 import os
-import sys
 import time
-import uuid
 import dill
+import tempfile
+
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 
 from abc import ABCMeta, abstractmethod
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from contextlib import contextmanager
 from io import BytesIO
 
 # Python 3 compatibility imports
-from six.moves import cPickle
 from six import iteritems, string_types
 
-from bd2k.util.exceptions import require
 from bd2k.util.expando import Expando
 from bd2k.util.humanize import human2bytes
 
-from toil.common import Toil, addOptions
+from toil.common import Toil, addOptions, safeUnpickleFromStream
 from toil.fileStore import DeferredFunction
 from toil.lib.bioio import (setLoggingFromOptions,
                             getTotalCpuTimeAndMemoryUsage,
                             getTotalCpuTime)
 from toil.resource import ModuleDescriptor
+from future.utils import with_metaclass
 
 logger = logging.getLogger( __name__ )
 
@@ -53,16 +62,17 @@ class JobLikeObject(object):
     If the object doesn't specify explicit requirements, these properties will fall back
     to the configured defaults. If the value cannot be determined, an AttributeError is raised.
     """
-    def __init__(self, requirements, unitName, jobName=None):
+    def __init__(self, requirements, unitName, displayName=None, jobName=None):
         cores = requirements.get('cores')
         memory = requirements.get('memory')
         disk = requirements.get('disk')
         preemptable = requirements.get('preemptable')
         if unitName is not None:
-            assert isinstance(unitName, str)
+            assert isinstance(unitName, (str, bytes))
         if jobName is not None:
-            assert isinstance(jobName, str)
+            assert isinstance(jobName, (str, bytes))
         self.unitName = unitName
+        self.displayName = displayName if displayName is not None else self.__class__.__name__
         self.jobName = jobName if jobName is not None else self.__class__.__name__
         self._cores = self._parseResource('cores', cores)
         self._memory = self._parseResource('memory', memory)
@@ -157,12 +167,12 @@ class JobLikeObject(object):
         >>> Job._parseResource('memory', object())
         Traceback (most recent call last):
         ...
-        TypeError: The 'memory' requirement does not accept values that are of <type 'object'>
+        TypeError: The 'memory' requirement does not accept values that are of ...
         """
         assert name in ('memory', 'disk', 'cores')
         if value is None:
             return value
-        elif isinstance(value, str):
+        elif isinstance(value, (str, bytes)):
             value = human2bytes(value)
         if isinstance(value, int):
             return value
@@ -186,8 +196,8 @@ class JobNode(JobLikeObject):
     This object bridges the job graph, job, and batchsystem classes
     """
     def __init__(self, requirements, jobName, unitName, jobStoreID,
-                 command, predecessorNumber=1):
-        super(JobNode, self).__init__(requirements=requirements, unitName=unitName, jobName=jobName)
+                 command, displayName=None, predecessorNumber=1):
+        super(JobNode, self).__init__(requirements=requirements, displayName=displayName, unitName=unitName, jobName=jobName)
         self.jobStoreID = jobStoreID
         self.predecessorNumber = predecessorNumber
         self.command = command
@@ -224,6 +234,7 @@ class JobNode(JobLikeObject):
                    command=jobGraph.command,
                    jobName=jobGraph.jobName,
                    unitName=jobGraph.unitName,
+                   displayName=jobGraph.displayName,
                    predecessorNumber=jobGraph.predecessorNumber)
 
     @classmethod
@@ -242,14 +253,15 @@ class JobNode(JobLikeObject):
                    command=command,
                    jobName=job.jobName,
                    unitName=job.unitName,
+                   displayName=job.displayName,
                    predecessorNumber=predecessorNumber)
 
 class Job(JobLikeObject):
     """
     Class represents a unit of work in toil.
     """
-    def __init__(self, memory=None, cores=None, disk=None, preemptable=None, unitName=None,
-                 checkpoint=False):
+    def __init__(self, memory=None, cores=None, disk=None, preemptable=None,
+                       unitName=None, checkpoint=False, displayName=None):
         """
         This method must be called by any overriding constructor.
 
@@ -269,8 +281,10 @@ class Job(JobLikeObject):
         """
         requirements = {'memory': memory, 'cores': cores, 'disk': disk,
                         'preemptable': preemptable}
-        super(Job, self).__init__(requirements=requirements, unitName=unitName)
+        super(Job, self).__init__(requirements=requirements, unitName=unitName, displayName=displayName)
         self.checkpoint = checkpoint
+        self.displayName = displayName if displayName is not None else self.__class__.__name__
+
         #Private class variables
 
         #See Job.addChild
@@ -294,6 +308,7 @@ class Job(JobLikeObject):
         self._rvs = collections.defaultdict(list)
         self._promiseJobStore = None
         self._fileStore = None
+        self._tempDir = None
 
     def run(self, fileStore):
         """
@@ -446,6 +461,24 @@ class Job(JobLikeObject):
         else:
             return self.addFollowOn(JobFunctionWrappingJob(fn, *args, **kwargs))
 
+    @property
+    def tempDir(self):
+        """
+        Shortcut to calling :func:`job.fileStore.getLocalTempDir`. Temp dir is created on first call
+        and will be returned for first and future calls
+        :return: Path to tempDir. See `job.fileStore.getLocalTempDir`
+        :rtype: str
+        """
+        if self._tempDir is None:
+            self._tempDir = self._fileStore.getLocalTempDir()
+        return self._tempDir
+
+    def log(self, text, level=logging.INFO):
+        """
+        convenience wrapper for :func:`fileStore.logToMaster`
+        """
+        self._fileStore.logToMaster(text, level)
+
     @staticmethod
     def wrapFn(fn, *args, **kwargs):
         """
@@ -526,7 +559,7 @@ class Job(JobLikeObject):
                                'predecessor of the job receiving the promise')
         with self._promiseJobStore.writeFileStream() as (fileHandle, jobStoreFileID):
             promise = UnfulfilledPromiseSentinel(str(self), False)
-            cPickle.dump(promise, fileHandle, cPickle.HIGHEST_PROTOCOL)
+            pickle.dump(promise, fileHandle, pickle.HIGHEST_PROTOCOL)
         self._rvs[path].append(jobStoreFileID)
         return self._promiseJobStore.config.jobStore, jobStoreFileID
 
@@ -574,12 +607,12 @@ class Job(JobLikeObject):
             if job not in visited:
                 visited.add(job)
                 if len(job._directPredecessors) > 0:
-                    map(lambda p : getRoots(p), job._directPredecessors)
+                    list(map(lambda p : getRoots(p), job._directPredecessors))
                 else:
                     roots.add(job)
                 #The following call ensures we explore all successor edges.
-                map(lambda c : getRoots(c), job._children +
-                    job._followOns)
+                list(map(lambda c : getRoots(c), job._children +
+                    job._followOns))
         getRoots(self)
         return roots
 
@@ -643,10 +676,10 @@ class Job(JobLikeObject):
 
         # All jobs in the component of the job graph containing self
         jobs = set()
-        map(lambda x : x._dfs(jobs), roots)
+        list(map(lambda x : x._dfs(jobs), roots))
 
         # Check for each job for which checkpoint is true that it is a cut vertex or leaf
-        for y in filter(lambda x : x.checkpoint, jobs):
+        for y in [x for x in jobs if x.checkpoint]:
             if y not in roots: # The roots are the prexisting jobs
                 if not Job._isLeafVertex(y):
                     raise JobGraphDeadlockException("New checkpoint job %s is not a leaf in the job graph" % y)
@@ -673,8 +706,8 @@ class Job(JobLikeObject):
 
         :param dict kwargs: The keyword arguments to the function
         """
-        require(self._fileStore is not None, 'A deferred function may only be registered with a '
-                                             'job while that job is running.')
+        if self._fileStore is None:
+            raise Exception('A deferred function may only be registered with a job while that job is running.')
         self._fileStore._registerDeferredFunction(DeferredFunction.create(function, *args, **kwargs))
 
 
@@ -696,7 +729,7 @@ class Job(JobLikeObject):
             :returns: The argument parser used by a toil workflow with added Toil options.
             :rtype: :class:`argparse.ArgumentParser`
             """
-            parser = ArgumentParser()
+            parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
             Job.Runner.addToilOptions(parser)
             return parser
 
@@ -727,7 +760,7 @@ class Job(JobLikeObject):
         @staticmethod
         def startToil(job, options):
             """
-            Deprecated by toil.common.Toil.run. Runs the toil workflow using the given options
+            Deprecated by toil.common.Toil.start. Runs the toil workflow using the given options
             (see Job.Runner.getDefaultOptions and Job.Runner.addToilOptions) starting with this
             job.
             :param toil.job.Job job: root job of the workflow
@@ -743,11 +776,10 @@ class Job(JobLikeObject):
                 else:
                     return toil.restart()
 
-    class Service(JobLikeObject):
+    class Service(with_metaclass(ABCMeta, JobLikeObject)):
         """
         Abstract class used to define the interface to a service.
         """
-        __metaclass__ = ABCMeta
         def __init__(self, memory=None, cores=None, disk=None, preemptable=None, unitName=None):
             """
             Memory, core and disk requirements are specified identically to as in \
@@ -865,13 +897,14 @@ class Job(JobLikeObject):
         logger.debug('Loading user module %s.', userModule)
         userModule = cls._loadUserModule(userModule)
         pickleFile = commandTokens[1]
-        if pickleFile == "firstJob":
-            openFileStream = jobStore.readSharedFileStream(pickleFile)
-        else:
-            openFileStream = jobStore.readFileStream(pickleFile)
-        with openFileStream as fileHandle:
-            return cls._unpickle(userModule, fileHandle, jobStore.config)
-
+        with tempfile.NamedTemporaryFile() as f:
+            filename = f.name
+            if pickleFile == "firstJob":
+                jobStore.readSharedFile(pickleFile, filename)
+            else:
+                jobStore.readFile(pickleFile, filename)
+            with open(filename) as fileHandle:
+                return cls._unpickle(userModule, fileHandle, jobStore.config)
 
     @classmethod
     def _unpickle(cls, userModule, fileHandle, config):
@@ -883,15 +916,20 @@ class Job(JobLikeObject):
         :param fileHandle:
         :returns:
         """
-        unpickler = cPickle.Unpickler(fileHandle)
+        unpickler = pickle.Unpickler(fileHandle)
 
         def filter_main(module_name, class_name):
-            if module_name == '__main__':
-                logger.debug('Getting %s from user module __main__ (%s).', class_name, userModule)
-                return getattr(userModule, class_name)
-            else:
-                logger.debug('Getting %s from module %s.', class_name, module_name)
-                return getattr(importlib.import_module(module_name), class_name)
+            try:
+                if module_name == '__main__':
+                    return getattr(userModule, class_name)
+                else:
+                    return getattr(importlib.import_module(module_name), class_name)
+            except:
+                if module_name == '__main__':
+                    logger.debug('Failed getting %s from module %s.', class_name, userModule)
+                else:
+                    logger.debug('Failed getting %s from module %s.', class_name, module_name)
+                raise
 
         unpickler.find_global = filter_main
         runnable = unpickler.load()
@@ -928,7 +966,7 @@ class Job(JobLikeObject):
                 # already complete.
                 if jobStore.fileExists(promiseFileStoreID):
                     with jobStore.updateFileStream(promiseFileStoreID) as fileHandle:
-                        cPickle.dump(promisedValue, fileHandle, cPickle.HIGHEST_PROTOCOL)
+                        pickle.dump(promisedValue, fileHandle, pickle.HIGHEST_PROTOCOL)
 
     # Functions associated with Job.checkJobGraphAcyclic to establish that the job graph does not
     # contain any cycles of dependencies:
@@ -969,7 +1007,7 @@ class Job(JobLikeObject):
         ##For each follow-on edge calculate the extra implied edges
         #Adjacency list of implied edges, i.e. map of jobs to lists of jobs
         #connected by an implied edge
-        extraEdges = dict(map(lambda n : (n, []), nodes))
+        extraEdges = dict([(n, []) for n in nodes])
         for job in nodes:
             if len(job._followOns) > 0:
                 #Get set of jobs connected by a directed path to job, starting
@@ -1002,8 +1040,7 @@ class Job(JobLikeObject):
         """
         jobsToJobGraphs = {self:jobGraph}
         for successors in (self._followOns, self._children):
-            jobs = map(lambda successor:
-                successor._makeJobGraphs2(jobStore, jobsToJobGraphs), successors)
+            jobs = [successor._makeJobGraphs2(jobStore, jobsToJobGraphs) for successor in successors]
             jobGraph.stack.append(jobs)
         return jobsToJobGraphs
 
@@ -1014,8 +1051,7 @@ class Job(JobLikeObject):
             jobsToJobGraphs[self] = jobGraph
             #Add followOns/children to be run after the current job.
             for successors in (self._followOns, self._children):
-                jobs = map(lambda successor:
-                    successor._makeJobGraphs2(jobStore, jobsToJobGraphs), successors)
+                jobs = [successor._makeJobGraphs2(jobStore, jobsToJobGraphs) for successor in successors]
                 jobGraph.stack.append(jobs)
         else:
             jobGraph = jobsToJobGraphs[self]
@@ -1043,7 +1079,7 @@ class Job(JobLikeObject):
             if job not in visited:
                 visited.add(job)
                 ordering.append(job)
-                map(getRunOrder, job._children + job._followOns)
+                list(map(getRunOrder, job._children + job._followOns))
         getRunOrder(self)
         return ordering
 
@@ -1061,7 +1097,7 @@ class Job(JobLikeObject):
         # for the mechanism which unpickles the job and executes the Job.run
         # method.
         with jobStore.writeFileStream(rootJobGraph.jobStoreID) as (fileHandle, fileStoreID):
-            cPickle.dump(self, fileHandle, cPickle.HIGHEST_PROTOCOL)
+            pickle.dump(self, fileHandle, pickle.HIGHEST_PROTOCOL)
         # Note that getUserScript() may have been overridden. This is intended. If we used
         # self.userModule directly, we'd be getting a reference to job.py if the job was
         # specified as a function (as opposed to a class) since that is where FunctionWrappingJob
@@ -1100,7 +1136,8 @@ class Job(JobLikeObject):
             # Create the service job tuple
             j = ServiceJobNode(jobStoreID=serviceJobGraph.jobStoreID,
                                memory=serviceJobGraph.memory, cores=serviceJobGraph.cores,
-                               disk=serviceJobGraph.disk, startJobStoreID=serviceJobGraph.startJobStoreID,
+                               disk=serviceJobGraph.disk, preemptable=serviceJobGraph.preemptable,
+                               startJobStoreID=serviceJobGraph.startJobStoreID,
                                terminateJobStoreID=serviceJobGraph.terminateJobStoreID,
                                errorJobStoreID=serviceJobGraph.errorJobStoreID,
                                jobName=serviceJobGraph.jobName, unitName=serviceJobGraph.unitName,
@@ -1117,7 +1154,7 @@ class Job(JobLikeObject):
             #service = serviceJob.service
 
             # Pickle the job
-            serviceJob.pickledService = cPickle.dumps(serviceJob.service, protocol=cPickle.HIGHEST_PROTOCOL)
+            serviceJob.pickledService = pickle.dumps(serviceJob.service, protocol=pickle.HIGHEST_PROTOCOL)
             serviceJob.service = None
 
             # Serialise the service job and job wrapper
@@ -1143,44 +1180,46 @@ class Job(JobLikeObject):
         self.checkJobGraphForDeadlocks()
 
         #Create the jobGraphs for followOns/children
-        jobsToJobGraphs = self._makeJobGraphs(jobGraph, jobStore)
+        with jobStore.batch():
+            jobsToJobGraphs = self._makeJobGraphs(jobGraph, jobStore)
         #Get an ordering on the jobs which we use for pickling the jobs in the
         #correct order to ensure the promises are properly established
         ordering = self.getTopologicalOrderingOfJobs()
         assert len(ordering) == len(jobsToJobGraphs)
 
-        # Temporarily set the jobStore locators for the promise call back functions
-        for job in ordering:
-            job.prepareForPromiseRegistration(jobStore)
-            def setForServices(serviceJob):
-                serviceJob.prepareForPromiseRegistration(jobStore)
-                for childServiceJob in serviceJob.service._childServices:
-                    setForServices(childServiceJob)
-            for serviceJob in job._services:
-                setForServices(serviceJob)
-
-        ordering.reverse()
-        assert self == ordering[-1]
-        if firstJob:
-            #If the first job we serialise all the jobs, including the root job
+        with jobStore.batch():
+            # Temporarily set the jobStore locators for the promise call back functions
             for job in ordering:
-                # Pickle the services for the job
-                job._serialiseServices(jobStore, jobsToJobGraphs[job], jobGraph)
-                # Now pickle the job
-                job._serialiseJob(jobStore, jobsToJobGraphs, jobGraph)
-        else:
-            #We store the return values at this point, because if a return value
-            #is a promise from another job, we need to register the promise
-            #before we serialise the other jobs
-            self._fulfillPromises(returnValues, jobStore)
-            #Pickle the non-root jobs
-            for job in ordering[:-1]:
-                # Pickle the services for the job
-                job._serialiseServices(jobStore, jobsToJobGraphs[job], jobGraph)
-                # Pickle the job itself
-                job._serialiseJob(jobStore, jobsToJobGraphs, jobGraph)
-            # Pickle any services for the job
-            self._serialiseServices(jobStore, jobGraph, jobGraph)
+                job.prepareForPromiseRegistration(jobStore)
+                def setForServices(serviceJob):
+                    serviceJob.prepareForPromiseRegistration(jobStore)
+                    for childServiceJob in serviceJob.service._childServices:
+                        setForServices(childServiceJob)
+                for serviceJob in job._services:
+                    setForServices(serviceJob)
+
+            ordering.reverse()
+            assert self == ordering[-1]
+            if firstJob:
+                #If the first job we serialise all the jobs, including the root job
+                for job in ordering:
+                    # Pickle the services for the job
+                    job._serialiseServices(jobStore, jobsToJobGraphs[job], jobGraph)
+                    # Now pickle the job
+                    job._serialiseJob(jobStore, jobsToJobGraphs, jobGraph)
+            else:
+                #We store the return values at this point, because if a return value
+                #is a promise from another job, we need to register the promise
+                #before we serialise the other jobs
+                self._fulfillPromises(returnValues, jobStore)
+                #Pickle the non-root jobs
+                for job in ordering[:-1]:
+                    # Pickle the services for the job
+                    job._serialiseServices(jobStore, jobsToJobGraphs[job], jobGraph)
+                    # Pickle the job itself
+                    job._serialiseJob(jobStore, jobsToJobGraphs, jobGraph)
+                # Pickle any services for the job
+                self._serialiseServices(jobStore, jobGraph, jobGraph)
 
     def _serialiseFirstJob(self, jobStore):
         """
@@ -1293,7 +1332,7 @@ class Job(JobLikeObject):
         """
         :rtype : string, used as identifier of the job class in the stats report.
         """
-        return self.__class__.__name__
+        return self.displayName
 
 
 class JobException( Exception ):
@@ -1334,7 +1373,7 @@ class FunctionWrappingJob(Job):
         if argSpec.defaults is None:
             argDict = {}
         else:
-            argDict = dict(zip(argSpec.args[-len(argSpec.defaults):], argSpec.defaults))
+            argDict = dict(list(zip(argSpec.args[-len(argSpec.defaults):], argSpec.defaults)))
 
         def resolve(key, default=None, dehumanize=False):
             try:
@@ -1386,14 +1425,26 @@ class FunctionWrappingJob(Job):
 
 class JobFunctionWrappingJob(FunctionWrappingJob):
     """
-    A job function is a function whose first argument is a :class:`.Job` \
-    instance that is the wrapping job for the function. This can be used to \
-    add successor jobs for the function and perform all the functions the \
+    A job function is a function whose first argument is a :class:`.Job`
+    instance that is the wrapping job for the function. This can be used to
+    add successor jobs for the function and perform all the functions the
     :class:`.Job` class provides.
 
-    To enable the job function to get access to the :class:`toil.fileStore.FileStore` \
-    instance (see :func:`toil.job.Job.run`), it is made a variable of the wrapping job \
+    To enable the job function to get access to the :class:`toil.fileStore.FileStore`
+    instance (see :func:`toil.job.Job.run`), it is made a variable of the wrapping job
     called fileStore.
+
+    To specify a job's resource requirements the following default keyword arguments
+    can be specified:
+
+        - memory
+        - disk
+        - cores
+
+    For example to wrap a function into a job we would call::
+
+        Job.wrapJobFn(myJob, memory='100k', disk='1M', cores=0.1)
+
     """
 
     @property
@@ -1472,6 +1523,12 @@ class EncapsulatedJob(Job):
         #  B will run after A and all its successors have completed, A and its subgraph of
         # successors in effect appear to be just one job.
 
+    If the job being encapsulated has predecessors (e.g. is not the root job), then the encapsulated
+    job will inherit these predecessors. If predecessors are added to the job being encapsulated
+    after the encapsulated job is created then the encapsulating job will NOT inherit these
+    predecessors automatically. Care should be exercised to ensure the encapsulated job has the
+    proper set of predecessors.
+
     The return value of an encapsulatd job (as accessed by the :func:`toil.job.Job.rv` function)
     is the return value of the root job, e.g. A().encapsulate().rv() and A().rv() will resolve to
     the same value after A or A.encapsulate() has been run.
@@ -1482,6 +1539,11 @@ class EncapsulatedJob(Job):
         """
         # Giving the root of the subgraph the same resources as the first job in the subgraph.
         Job.__init__(self, **job._requirements)
+        # Ensure that the encapsulated job has the same direct predecessors as the job
+        # being encapsulated.
+        if job._directPredecessors:
+            for job_ in job._directPredecessors:
+                job_.addChild(self)
         self.encapsulatedJob = job
         Job.addChild(self, job)
         # Use small resource requirements for dummy Job instance.
@@ -1509,9 +1571,9 @@ class EncapsulatedJob(Job):
 
 
 class ServiceJobNode(JobNode):
-    def __init__(self, jobStoreID, memory, cores, disk, startJobStoreID, terminateJobStoreID,
+    def __init__(self, jobStoreID, memory, cores, disk, preemptable, startJobStoreID, terminateJobStoreID,
                  errorJobStoreID, unitName, jobName, command, predecessorNumber):
-        requirements = dict(memory=memory, cores=cores, disk=disk, preemptable=False)
+        requirements = dict(memory=memory, cores=cores, disk=disk, preemptable=preemptable)
         super(ServiceJobNode, self).__init__(unitName=unitName, jobName=jobName,
                                              requirements=requirements,
                                              jobStoreID=jobStoreID,
@@ -1686,7 +1748,7 @@ class Promise(object):
         with cls._jobstore.readFileStream(jobStoreFileID) as fileHandle:
             # If this doesn't work then the file containing the promise may not exist or be
             # corrupted
-            value = cPickle.load(fileHandle)
+            value = safeUnpickleFromStream(fileHandle)
             return value
 
 

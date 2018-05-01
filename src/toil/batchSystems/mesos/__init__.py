@@ -13,7 +13,10 @@
 # limitations under the License.
 from __future__ import absolute_import
 
-from Queue import Queue
+from future import standard_library
+standard_library.install_aliases()
+from builtins import object
+from queue import Queue
 from collections import namedtuple
 from functools import total_ordering
 from bisect import bisect
@@ -24,6 +27,8 @@ TaskData = namedtuple('TaskData', (
     'startTime',
     # Mesos' ID of the slave where task is being run
     'slaveID',
+    # IP of slave where task is being run
+    'slaveIP',
     # Mesos' ID of the executor running the task
     'executorID',
     # Memory requirement of the task
@@ -54,7 +59,7 @@ class JobQueue(object):
 
     def jobIDs(self):
         with self.jobLock:
-            return [job.jobID for queue in self.queues.values() for job in list(queue.queue)]
+            return [job.jobID for queue in list(self.queues.values()) for job in list(queue.queue)]
 
     def nextJobOfType(self, jobType):
         with self.jobLock:

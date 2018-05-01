@@ -1,82 +1,42 @@
 .. highlight:: console
 
-Building from Source
-====================
+.. _runningTests:
 
-For developers, tinkerers, and people otherwise interested in Toil's internals,
-this section explains how to build Toil from source and run its test suite.
-
-Building from master
---------------------
-
-First, clone the source::
-
-   $ git clone https://github.com/BD2KGenomics/toil
-   $ cd toil
-
-Then, create and activate a virtualenv::
-
-   $ virtualenv venv
-   $ . venv/bin/activate
-
-From there, you can list all available Make targets by running ``make``.
-First and foremost, we want to install Toil's build requirements. (These are
-additional packages that Toil needs to be tested and built but not to be run.)
-
-::
-
-    $ make prepare
-
-Now, we can install Toil in `development mode`_ (such that changes to the
-source code will immediately affect the virtualenv)::
-
-    $ make develop
-
-Or, to install with support for all optional :ref:`extras`::
-
-    $ make develop extras=[aws,mesos,azure,google,encryption,cwl]
-
-To build the docs, run ``make develop`` with all extras followed by
-
-::
-
-    $ make docs
-
-.. _development mode: https://pythonhosted.org/setuptools/setuptools.html#development-mode
-
-Running tests
+Running Tests
 -------------
 
-To invoke all tests (unit and integration) use
+Test make targets, invoked as ``$ make <target>``, subject to which
+environment variables are set (see :ref:`test_env_vars`).
+
++-------------------------+---------------------------------------------------+
+|     TARGET              |        DESCRIPTION                                |
++-------------------------+---------------------------------------------------+
+|  test                   | Invokes all tests.                                |
++-------------------------+---------------------------------------------------+
+| integration_test        | Invokes only the integration tests.               |
++-------------------------+---------------------------------------------------+
+| test_offline            | Skips building the Docker appliance and only      |
+|                         | invokes tests that have no docker dependencies.   |
++-------------------------+---------------------------------------------------+
+| integration_test_local  | Makes integration tests easier to debug locally   |
+|                         | by running the integration tests serially and     |
+|                         | doesn't redirect output. This makes it appears on |
+|                         | the terminal as expected.                         |
++-------------------------+---------------------------------------------------+
+
+Run all tests (including slow tests):
 
 ::
 
     $ make test
 
-.. topic:: Installing Docker with Quay
+Run only quick tests (as of Sep 18, 2017, this was < 30 minutes):
 
-   `Docker`_ is needed for some of the tests. Follow the appopriate
-   installation instructions for your system on their website to get started.
+::
 
-   When running ``make test`` you might still get the following error::
+    $ export TOIL_TEST_QUICK=True; make test
 
-      $ make test
-      Please set TOIL_DOCKER_REGISTRY, e.g. to quay.io/USER.
-
-   To solve, make an account with `Quay`_ and specify it like so::
-
-      $ TOIL_DOCKER_REGISTRY=quay.io/USER make test
-
-   where ``USER`` is your Quay username.
-
-   For convenience you may want to add this variable to your bashrc by running
-
-   ::
-
-      $ echo 'export TOIL_DOCKER_REGISTRY=quay.io/USER' >> $HOME/.bashrc
-
-
-Run an individual test with
+Run an individual test with:
 
 ::
 
@@ -85,7 +45,7 @@ Run an individual test with
 The default value for ``tests`` is ``"src"`` which includes all tests in the
 ``src/`` subdirectory of the project root. Tests that require a particular
 feature will be skipped implicitly. If you want to explicitly skip tests that
-depend on a currently installed *feature*, use
+depend on a currently installed *feature*, use:
 
 ::
 
@@ -95,11 +55,111 @@ This will run only the tests that don't depend on the ``azure`` extra, even if
 that extra is currently installed. Note the distinction between the terms
 *feature* and *extra*. Every extra is a feature but there are features that are
 not extras, such as the ``gridengine`` and ``parasol`` features.  To skip tests
-involving both the Parasol feature and the Azure extra, use the following::
+involving both the Parasol feature and the Azure extra, use the following
+
+::
 
     $ make test tests="-m 'not azure and not parasol' src"
 
-Running Mesos tests
+Running Tests (pytest)
+~~~~~~~~~~~~~~~~~~~~~~
+
+Often it is simpler to use pytest directly, instead of calling the ``make`` wrapper.
+This usually works as expected, but some tests need some manual preparation.
+
+ - Running tests that make use of Docker (e.g. autoscaling tests and Docker tests)
+   require an appliance image to be hosted. This process first requires :ref:`quaySetup`.
+   Then to build and host the appliance image run the ``make`` targets ``docker``
+   and ``push_docker`` respectively.
+
+ - Running integration tests require setting the environment variable ::
+
+       export TOIL_TEST_INTEGRATIVE=True
+
+To run a specific test with pytest ::
+
+    python -m pytest src/toil/test/sort/sortTest.py::SortTest::testSort
+
+For more information, see the `pytest documentation`_.
+
+.. _pytest documentation: https://docs.pytest.org/en/latest/
+
+.. _test_env_vars:
+
+Test Environment Variables
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
++------------------------+----------------------------------------------------+
+| TOIL_TEST_TEMP         | An absolute path to a directory where Toil tests   |
+|                        | will write their temporary files. Defaults to the  |
+|                        | system's `standard temporary directory`_.          |
++------------------------+----------------------------------------------------+
+| TOIL_TEST_INTEGRATIVE  | If ``True``, this allows the integration tests to  |
+|                        | run. Only valid when running the tests from the    |
+|                        | source directory via ``make test`` or              |
+|                        | ``make test_parallel``.                            |
++------------------------+----------------------------------------------------+
+| TOIL_TEST_EXPERIMENTAL | If ``True``, this allows tests on experimental     |
+|                        | features to run (such as the Google and Azure) job |
+|                        | stores. Only valid when running tests from the     |
+|                        | source directory via ``make test`` or              |
+|                        | ``make test_parallel``.                            |
++------------------------+----------------------------------------------------+
+| TOIL_AWS_KEYNAME       | An AWS keyname (see :ref:`prepareAWS`), which      |
+|                        | is required to run the AWS tests.                  |
++------------------------+----------------------------------------------------+
+| TOIL_AZURE_KEYNAME     | An Azure storage account keyname (see              |
+|                        | :ref:`prepareAzure`),                              |
+|                        | which is required to run the Azure tests.          |
++------------------------+----------------------------------------------------+
+| TOIL_AZURE_ZONE        | The region in which to run the Azure tests.        |
++------------------------+----------------------------------------------------+
+| TOIL_SSH_KEYNAME       | The SSH key to use for tests.                      |
++------------------------+----------------------------------------------------+
+| PUBLIC_KEY_FILE        | For Azure provisioner tests, the path to the       |
+|                        | public key file if not ~/.ssh/id_rsa.pub           |
++------------------------+----------------------------------------------------+
+| TOIL_GOOGLE_PROJECTID  | A Google Cloud account projectID                   |
+|                        | (see :ref:`runningGCE`), which is required to      |
+|                        | to run the Google Cloud tests.                     |
++------------------------+----------------------------------------------------+
+| TOIL_TEST_QUICK        | If ``True``, long running tests are skipped.       |
++------------------------+----------------------------------------------------+
+
+.. _standard temporary directory: https://docs.python.org/2/library/tempfile.html#tempfile.gettempdir
+
+.. admonition:: Partial install and failing tests.
+
+    Some tests may fail with an ImportError if the required extras are not installed. 
+    Install Toil with all of the extras
+    do prevent such errors.
+
+.. _quaySetup:
+
+Using Docker with Quay
+~~~~~~~~~~~~~~~~~~~~~~
+
+`Docker`_ is needed for some of the tests. Follow the appropriate
+installation instructions for your system on their website to get started.
+
+When running ``make test`` you might still get the following error::
+
+   $ make test
+   Please set TOIL_DOCKER_REGISTRY, e.g. to quay.io/USER.
+
+To solve, make an account with `Quay`_ and specify it like so::
+
+   $ TOIL_DOCKER_REGISTRY=quay.io/USER make test
+
+where ``USER`` is your Quay username.
+
+For convenience you may want to add this variable to your bashrc by running
+
+::
+
+   $ echo 'export TOIL_DOCKER_REGISTRY=quay.io/USER' >> $HOME/.bashrc
+
+Running Mesos Tests
 ~~~~~~~~~~~~~~~~~~~
 
 If you're running Toil's Mesos tests, be sure to create the virtualenv with
@@ -115,13 +175,12 @@ this may come up empty. To fix it, run the following:
 .. _Quay: https://quay.io/
 .. _log into Quay: https://docs.quay.io/solution/getting-started.html
 
-
 .. _appliance_dev:
 
-Developing with the Toil Appliance
-----------------------------------
+Developing with Docker
+----------------------
 
-To develop on features reliant on the Toil Appliance (i.e. autoscaling), you
+To develop on features reliant on the Toil Appliance (the docker image toil uses for AWS autoscaling), you
 should consider setting up a personal registry on `Quay`_ or `Docker Hub`_. Because
 the Toil Appliance images are tagged with the Git commit they are based on and
 because only commits on our master branch trigger an appliance build on Quay,
@@ -129,9 +188,17 @@ as soon as a developer makes a commit or dirties the working copy they will no
 longer be able to rely on Toil to automatically detect the proper Toil Appliance
 image. Instead, developers wishing to test any appliance changes in autoscaling
 should build and push their own appliance image to a personal Docker registry.
+This is described in the next section.
 
-Here is a general workflow: (similar instructions apply when using
-Docker Hub)
+Making Your Own Toil Docker Image
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+**Note!**  Toil checks if the docker image specified by TOIL_APPLIANCE_SELF
+exists prior to launching by using the docker v2 schema.  This should be
+valid for any major docker repository, but there is an option to override
+this if desired using the option: `--forceDockerAppliance`.
+
+Here is a general workflow (similar instructions apply when using Docker Hub):
 
 1. Make some changes to the provisioner of your local version of Toil.
 
@@ -141,7 +208,7 @@ Docker Hub)
 
    to automatically build a docker image that can now be uploaded to
    your personal `Quay`_ account. If you have not installed Toil source
-   code yet check out `Building from Source`_.
+   code yet see :ref:`buildFromSource`.
 
 3. If it's not already you will need Docker installed and need
    to `log into Quay`_. Also you will want to make sure that your Quay
@@ -168,10 +235,10 @@ Docker Hub)
    :ref:`envars`.
 
 7. Now you can launch your cluster! For more information see
-   :ref:`Toil_Provisioner`.
+   :ref:`Autoscaling`.
 
-Running Cluster Locally
-~~~~~~~~~~~~~~~~~~~~~~~
+Running a Cluster Locally
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The Toil Appliance container can also be useful as a test environment since it
 can simulate a Toil cluster locally. An important caveat for this is autoscaling,
@@ -225,16 +292,13 @@ with ``worker`` to get shell access in your worker.
     if Docker can't find the file/directory on the host it will silently fail and mount
     in an empty directory.
 
-
 .. _Quay: https://quay.io/
-
 .. _Docker Hub: https://hub.docker.com/
-
-Contributing
-============
 
 Maintainer's Guidelines
 -----------------------
+
+In general, as developers and maintainers of the code, we adhere to the following guidelines:
 
 * We strive to never break the build on master.
 
@@ -244,8 +308,8 @@ Maintainer's Guidelines
 * The commit message of direct commits to master must end in ``(resolves #``
   followed by the issue number followed by ``)``.
 
-Naming conventions
-------------------
+Naming Conventions
+~~~~~~~~~~~~~~~~~~
 
 * The **branch name** for a pull request starts with ``issues/`` followed by the
   issue number (or numbers, separated by a dash), followed by a short
@@ -276,9 +340,8 @@ case of bar (resolves #123).`
 .. _here: http://chris.beams.io/posts/git-commit/
 .. _Waffle: https://waffle.io/BD2KGenomics/toil
 
-Pull requests
--------------
-
+Pull Requests
+~~~~~~~~~~~~~
 * All pull requests must be reviewed by a person other than the request's
   author.
 
@@ -296,8 +359,8 @@ Pull requests
 
 .. _multi-author:
 
-Multi-author pull requests
---------------------------
+Multi-Author Pull Requests
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 * A pull request starts off as single-author and can be changed to multi-author
   upon request via comment (typically by the reviewer) in the PR. The author of
@@ -314,4 +377,3 @@ Multi-author pull requests
   the request after making sure they don't have any unpushed changes they care
   about. This is necessary because a single-author PR can be reabsed and
   rebasing would make it hard to integrate these pushed commits.
-

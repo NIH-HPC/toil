@@ -1,3 +1,4 @@
+from builtins import range
 import errno
 import multiprocessing
 import os
@@ -21,7 +22,7 @@ class SystemTest(ToilTest):
                 numTasks = multiprocessing.cpu_count() * 10
                 grandChildIds = pool.map_async(
                     func=partial(_testAtomicityOfNonEmptyDirectoryRenamesTask, parent, child),
-                    iterable=range(numTasks))
+                    iterable=list(range(numTasks)))
                 grandChildIds = grandChildIds.get()
             finally:
                 pool.close()
@@ -45,7 +46,7 @@ def _testAtomicityOfNonEmptyDirectoryRenamesTask(parent, child, _):
     try:
         os.rename(tmpChildDir, child)
     except OSError as e:
-        if e.errno == errno.ENOTEMPTY:
+        if e.errno == errno.ENOTEMPTY or e.errno == errno.EEXIST:
             os.unlink(grandChild)
             os.rmdir(tmpChildDir)
             return None

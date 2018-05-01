@@ -14,25 +14,43 @@
 
 from __future__ import absolute_import
 
+from future import standard_library
+standard_library.install_aliases()
+from builtins import str
+from builtins import range
+from builtins import object
 import logging
 import os
 import re
 import sys
 import tempfile
 import time
+import uuid
+from toil import subprocess
+import requests
 from argparse import ArgumentParser
-from threading import Thread
+
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 
 # Python 3 compatibility imports
-from six.moves import cPickle
 from six import iteritems
 
-from bd2k.util.exceptions import require
 from bd2k.util.humanize import bytes2human
+from bd2k.util.retry import retry
 
 from toil import logProcessContext
 from toil.lib.bioio import addLoggingOptions, getLogLevelString, setLoggingFromOptions
 from toil.realtimeLogger import RealtimeLogger
+from toil.batchSystems.options import addOptions as addBatchOptions
+from toil.batchSystems.options import setDefaultOptions as setDefaultBatchOptions
+from toil.batchSystems.options import setOptions as setBatchOptions
+from toil.provisioners import clusterFactory
+
+from toil import lookupEnvVar
+from toil.version import dockerRegistry, dockerTag
 
 logger = logging.getLogger(__name__)
 
@@ -68,33 +86,26 @@ class Config(object):
         self.restart = False
 
         #Batch system options
-        self.batchSystem = "singleMachine"
-        self.disableHotDeployment = False
-        self.scale = 1
-        self.mesosMasterAddress = 'localhost:5050'
-        self.parasolCommand = "parasol"
-        self.parasolMaxBatches = 10000
-        self.environment = {}
+        setDefaultBatchOptions(self)
 
         #Autoscaling options
         self.provisioner = None
-        self.nodeType = None
+        self.nodeTypes = []
         self.nodeOptions = None
-        self.minNodes = 0
-        self.maxNodes = 10
-        self.preemptableNodeType = None
-        self.preemptableNodeOptions = None
-        self.minPreemptableNodes = 0
-        self.maxPreemptableNodes = 0
-        self.alphaPacking = 0.8
+        self.minNodes = None
+        self.maxNodes = [10]
+        self.alphaPacking = 0.0
         self.betaInertia = 1.2
         self.scaleInterval = 30
         self.preemptableCompensation = 0.0
+        self.nodeStorage = 50
+        self.metrics = False
         
         # Parameters to limit service jobs, so preventing deadlock scheduling scenarios
-        self.maxPreemptableServiceJobs = sys.maxint 
-        self.maxServiceJobs = sys.maxint
+        self.maxPreemptableServiceJobs = sys.maxsize
+        self.maxServiceJobs = sys.maxsize
         self.deadlockWait = 60 # Wait one minute before declaring a deadlock
+        self.statePollingWait = 1 # Wait 1 seconds before querying job state
 
         #Resource requirements
         self.defaultMemory = 2147483648
@@ -102,17 +113,18 @@ class Config(object):
         self.defaultDisk = 2147483648
         self.readGlobalFileMutableByDefault = False
         self.defaultPreemptable = False
-        self.maxCores = sys.maxint
-        self.maxMemory = sys.maxint
-        self.maxDisk = sys.maxint
+        self.maxCores = sys.maxsize
+        self.maxMemory = sys.maxsize
+        self.maxDisk = sys.maxsize
 
         #Retrying/rescuing jobs
-        self.retryCount = 0
-        self.maxJobDuration = sys.maxint
+        self.retryCount = 1
+        self.maxJobDuration = sys.maxsize
         self.rescueJobsFrequency = 3600
 
         #Misc
-        self.disableCaching = False
+        self.disableCaching = True
+        self.disableChaining = False
         self.maxLogFileSize = 64000
         self.writeLogs = None
         self.writeLogsGzip = None
@@ -120,10 +132,15 @@ class Config(object):
         self.cseKey = None
         self.servicePollingInterval = 60
         self.useAsync = True
+        self.forceDockerAppliance = False
 
         #Debug options
+        self.debugWorker = False
         self.badWorker = 0.0
         self.badWorkerFailInterval = 0.01
+
+        # CWL
+        self.cwl = False
 
     def setOptions(self, options):
         """
@@ -131,10 +148,13 @@ class Config(object):
         """
         from bd2k.util.humanize import human2bytes #This import is used to convert
         #from human readable quantites to integers
-        def setOption(varName, parsingFn=None, checkFn=None):
+        def setOption(varName, parsingFn=None, checkFn=None, default=None):
             #If options object has the option "varName" specified
             #then set the "varName" attrib to this value in the config object
             x = getattr(options, varName, None)
+            if x is None:
+                x = default
+
             if x is not None:
                 if parsingFn is not None:
                     x = parsingFn(x)
@@ -149,20 +169,6 @@ class Config(object):
         # Function to parse integer from string expressed in different formats
         h2b = lambda x : human2bytes(str(x))
 
-        def iC(minValue, maxValue=sys.maxint):
-            # Returns function that checks if a given int is in the given half-open interval
-            assert isinstance(minValue, int) and isinstance(maxValue, int)
-            return lambda x: minValue <= x < maxValue
-
-        def fC(minValue, maxValue=None):
-            # Returns function that checks if a given float is in the given half-open interval
-            assert isinstance(minValue, float)
-            if maxValue is None:
-                return lambda x: minValue <= x
-            else:
-                assert isinstance(maxValue, float)
-                return lambda x: minValue <= x < maxValue
-
         def parseJobStore(s):
             name, rest = Toil.parseLocator(s)
             if name == 'file':
@@ -171,6 +177,14 @@ class Config(object):
                 return Toil.buildLocator(name, os.path.abspath(rest))
             else:
                 return s
+        def parseStrList(s):
+            s = s.split(",")
+            s = [str(x) for x in s]
+            return s
+        def parseIntList(s):
+            s = s.split(",")
+            s = [int(x) for x in s]
+            return s
 
         #Core options
         setOption("jobStore", parsingFn=parseJobStore)
@@ -200,37 +214,36 @@ class Config(object):
 
         #Batch system options
         setOption("batchSystem")
-        setOption("disableHotDeployment")
+        setBatchOptions(self, setOption)
+        setOption("disableAutoDeployment")
         setOption("scale", float, fC(0.0))
         setOption("mesosMasterAddress")
         setOption("parasolCommand")
         setOption("parasolMaxBatches", int, iC(1))
+        setOption("linkImports")
 
         setOption("environment", parseSetEnv)
 
         #Autoscaling options
         setOption("provisioner")
-        setOption("nodeType")
+        setOption("nodeTypes", parseStrList)
         setOption("nodeOptions")
-        setOption("minNodes", int)
-        setOption("maxNodes", int)
-        setOption("preemptableNodeType")
-        setOption("preemptableNodeOptions")
-        setOption("minPreemptableNodes", int)
-        setOption("maxPreemptableNodes", int)
+        setOption("minNodes", parseIntList)
+        setOption("maxNodes", parseIntList)
         setOption("alphaPacking", float)
         setOption("betaInertia", float)
         setOption("scaleInterval", float)
-
+        setOption("metrics")
         setOption("preemptableCompensation", float)
-        require(0.0 <= self.preemptableCompensation <= 1.0,
-                '--preemptableCompensation (%f) must be >= 0.0 and <= 1.0',
-                self.preemptableCompensation)
-        
+        if not 0.0 <= self.preemptableCompensation <= 1.0:
+            raise Exception('--preemptableCompensation (%f) must be >= 0.0 and <= 1.0.' % self.preemptableCompensation)
+        setOption("nodeStorage", int)
+
         # Parameters to limit service jobs / detect deadlocks
         setOption("maxServiceJobs", int)
         setOption("maxPreemptableServiceJobs", int)
         setOption("deadlockWait", int)
+        setOption("statePollingWait", int)
 
         # Resource requirements
         setOption("defaultMemory", h2b, iC(1))
@@ -243,12 +256,14 @@ class Config(object):
         setOption("defaultPreemptable")
 
         #Retrying/rescuing jobs
-        setOption("retryCount", int, iC(0))
+        setOption("retryCount", int, iC(1))
         setOption("maxJobDuration", int, iC(1))
         setOption("rescueJobsFrequency", int, iC(1))
 
         #Misc
+        setOption("maxLocalJobs", int)
         setOption("disableCaching")
+        setOption("disableChaining")
         setOption("maxLogFileSize", h2b, iC(1))
         setOption("writeLogs")
         setOption("writeLogsGzip")
@@ -259,8 +274,10 @@ class Config(object):
         setOption("sseKey", checkFn=checkSse)
         setOption("cseKey", checkFn=checkSse)
         setOption("servicePollingInterval", float, fC(0.0))
+        setOption("forceDockerAppliance")
 
         #Debug options
+        setOption("debugWorker")
         setOption("badWorker", float, fC(0.0, 1.0))
         setOption("badWorkerFailInterval", float, fC(0.0))
 
@@ -298,7 +315,6 @@ def _addOptions(addGroupFn, config):
                      "run should be placed. Temp files and folders will be placed in a directory "
                      "toil-<workflowID> within workDir (The workflowID is generated by Toil and "
                      "will be reported in the workflow logs. Default is determined by the "
-                     "user-defined environmental variable TOIL_TEMPDIR, or the environment "
                      "variables (TMPDIR, TEMP, TMP) via mkdtemp. This directory needs to exist on "
                      "all machines running jobs.")
     addOptionFn("--stats", dest="stats", action="store_true", default=None,
@@ -329,33 +345,17 @@ def _addOptions(addGroupFn, config):
                              "Allows the restart of an existing workflow")
     addOptionFn("--restart", dest="restart", default=None, action="store_true",
                 help="If --restart is specified then will attempt to restart existing workflow "
-                "at the location pointed to by the --jobStore option. Will raise an exception if the workflow does not exist")
+                     "at the location pointed to by the --jobStore option. Will raise an exception "
+                     "if the workflow does not exist")
 
     #
     #Batch system options
     #
 
     addOptionFn = addGroupFn("toil options for specifying the batch system",
-                             "Allows the specification of the batch system, and arguments to the batch system/big batch system (see below).")
-    addOptionFn("--batchSystem", dest="batchSystem", default=None,
-                      help=("The type of batch system to run the job(s) with, currently can be one "
-                            "of singleMachine, parasol, gridEngine, lsf or mesos'. default=%s" % config.batchSystem))
-    addOptionFn("--disableHotDeployment", dest="disableHotDeployment", action='store_true', default=None,
-                help=("Should hot-deployment of the user script be deactivated? If True, the user "
-                      "script/package should be present at the same location on all workers. "
-                      "default=%s" % config.disableHotDeployment))
-    addOptionFn("--scale", dest="scale", default=None,
-                help=("A scaling factor to change the value of all submitted tasks's submitted cores. "
-                      "Used in singleMachine batch system. default=%s" % config.scale))
-    addOptionFn("--mesosMaster", dest="mesosMasterAddress", default=None,
-                help=("The host and port of the Mesos master separated by colon. default=%s" % config.mesosMasterAddress))
-    addOptionFn("--parasolCommand", dest="parasolCommand", default=None,
-                      help="The name or path of the parasol program. Will be looked up on PATH "
-                           "unless it starts with a slashdefault=%s" % config.parasolCommand)
-    addOptionFn("--parasolMaxBatches", dest="parasolMaxBatches", default=None,
-                help="Maximum number of job batches the Parasol batch is allowed to create. One "
-                     "batch is created for jobs with a a unique set of resource requirements. "
-                     "default=%i" % config.parasolMaxBatches)
+                             "Allows the specification of the batch system, and arguments to the "
+                             "batch system/big batch system (see below).")
+    addBatchOptions(addOptionFn, config)
 
     #
     #Auto scaling options
@@ -365,36 +365,38 @@ def _addOptions(addGroupFn, config):
                              "in an autoscaled cluster, as well as parameters to control the "
                              "level of provisioning.")
 
-    addOptionFn("--provisioner", dest="provisioner", choices=['aws'],
+    addOptionFn("--provisioner", dest="provisioner", choices=['aws', 'azure', 'gce'],
                 help="The provisioner for cluster auto-scaling. The currently supported choices are"
-                     "'cgcloud' or 'aws'. The default is %s." % config.provisioner)
+                     "'azure', 'gce', or 'aws'. The default is %s." % config.provisioner)
 
-    for preemptable in (False, True):
-        def _addOptionFn(*name, **kwargs):
-            name = list(name)
-            if preemptable:
-                name.insert(-1, 'preemptable' )
-            name = ''.join((s[0].upper() + s[1:]) if i else s for i, s in enumerate(name))
-            terms = re.compile(r'\{([^{}]+)\}')
-            _help = kwargs.pop('help')
-            _help = ''.join((term.split('|') * 2)[int(preemptable)] for term in terms.split(_help))
-            addOptionFn('--' + name, dest=name,
-                        help=_help + ' The default is %s.' % getattr(config, name),
-                        **kwargs)
+    addOptionFn('--nodeTypes', default=None,
+                 help="List of node types separated by commas. The syntax for each node type "
+                      "depends on the provisioner used. For the cgcloud and AWS provisioners "
+                      "this is the name of an EC2 instance type, optionally followed by a "
+                      "colon and the price in dollars "
+                      "to bid for a spot instance of that type, for example 'c3.8xlarge:0.42'."
+                      "If no spot bid is specified, nodes of this type will be non-preemptable."
+                      "It is acceptable to specify an instance as both preemptable and "
+                      "non-preemptable, including it twice in the list. In that case,"
+                      "preemptable nodes of that type will be preferred when creating "
+                      "new nodes once the maximum number of preemptable-nodes has been"
+                      "reached.")
 
-        _addOptionFn('nodeType', metavar='TYPE',
-                     help="Node type for {non-|}preemptable nodes. The syntax depends on the "
-                          "provisioner used. For the cgcloud and AWS provisioners this is the name "
-                          "of an EC2 instance type{|, followed by a colon and the price in dollar "
-                          "to bid for a spot instance}, for example 'c3.8xlarge{|:0.42}'.")
-        _addOptionFn('nodeOptions', metavar='OPTIONS',
-                     help="Provisioning options for the {non-|}preemptable node type. The syntax "
-                          "depends on the provisioner used. Neither the CGCloud nor the AWS "
-                          "provisioner support any node options.")
-        for p, q in [('min', 'Minimum'), ('max', 'Maximum')]:
-            _addOptionFn(p, 'nodes', default=None, metavar='NUM',
-                         help=q + " number of {non-|}preemptable nodes in the cluster, if using "
-                                  "auto-scaling.")
+    addOptionFn('--nodeOptions', default=None,
+                 help="Options for provisioning the nodes. The syntax "
+                      "depends on the provisioner used. Neither the CGCloud nor the AWS "
+                      "provisioner support any node options.")
+
+    addOptionFn('--minNodes', default=None, 
+                 help="Mininum number of nodes of each type in the cluster, if using "
+                              "auto-scaling. This should be provided as a comma-separated "
+                              "list of the same length as the list of node types. default=0")
+
+    addOptionFn('--maxNodes', default=None,
+                help="Maximum number of nodes of each type in the cluster, if using "
+                "autoscaling, provided as a comma-separated list. The first value is used "
+                "as a default if the list length is less than the number of nodeTypes. "
+                "default=%s" % config.maxNodes[0])
 
     # TODO: DESCRIBE THE FOLLOWING TWO PARAMETERS
     addOptionFn("--alphaPacking", dest="alphaPacking", default=None,
@@ -419,20 +421,32 @@ def _addOptions(addGroupFn, config):
                       "missing preemptable nodes with a non-preemptable one. A value of 1.0 "
                       "replaces every missing pre-emptable node with a non-preemptable one." %
                       config.preemptableCompensation))
-    
+    addOptionFn("--nodeStorage", dest="nodeStorage", default=50,
+                help=("Specify the size of the root volume of worker nodes when they are launched "
+                      "in gigabytes. You may want to set this if your jobs require a lot of disk "
+                      "space. The default value is 50."))
+    addOptionFn("--metrics", dest="metrics",
+                default=False, action="store_true",
+                help=("Enable the prometheus/grafana dashboard for monitoring CPU/RAM usage, queue size, "
+                      "and issued jobs."))
+
     #        
     # Parameters to limit service jobs / detect service deadlocks
     #
-    addOptionFn = addGroupFn("toil options for limiting the number of service jobs and detecting service deadlocks",
-                             "Allows the specification of the maximum number of service jobs "
-                             "in a cluster. By keeping this limited "
-                             " we can avoid all the nodes being occupied with services, so causing a deadlock")
-    addOptionFn("--maxServiceJobs", dest="maxServiceJobs", default=None,
-                help=("The maximum number of service jobs that can be run concurrently, excluding service jobs running on preemptable nodes. default=%s" % config.maxServiceJobs))
-    addOptionFn("--maxPreemptableServiceJobs", dest="maxPreemptableServiceJobs", default=None,
-                help=("The maximum number of service jobs that can run concurrently on preemptable nodes. default=%s" % config.maxPreemptableServiceJobs))
-    addOptionFn("--deadlockWait", dest="deadlockWait", default=None,
-                help=("The minimum number of seconds to observe the cluster stuck running only the same service jobs before throwing a deadlock exception. default=%s" % config.deadlockWait))
+    if not config.cwl:
+        addOptionFn = addGroupFn("toil options for limiting the number of service jobs and detecting service deadlocks",
+                                 "Allows the specification of the maximum number of service jobs "
+                                 "in a cluster. By keeping this limited "
+                                 " we can avoid all the nodes being occupied with services, so causing a deadlock")
+        addOptionFn("--maxServiceJobs", dest="maxServiceJobs", default=None,
+                    help=("The maximum number of service jobs that can be run concurrently, excluding service jobs running on preemptable nodes. default=%s" % config.maxServiceJobs))
+        addOptionFn("--maxPreemptableServiceJobs", dest="maxPreemptableServiceJobs", default=None,
+                    help=("The maximum number of service jobs that can run concurrently on preemptable nodes. default=%s" % config.maxPreemptableServiceJobs))
+        addOptionFn("--deadlockWait", dest="deadlockWait", default=None,
+                    help=("The minimum number of seconds to observe the cluster stuck running only the same service jobs before throwing a deadlock exception. default=%s" % config.deadlockWait))
+        addOptionFn("--statePollingWait", dest="statePollingWait", default=1,
+                    help=("Time, in seconds, to wait before doing a scheduler query for job state. "
+                          "Return cached results if within the waiting period."))
 
     #
     #Resource requirements
@@ -458,13 +472,6 @@ def _addOptions(addGroupFn, config):
                      bytes2human( config.defaultDisk, symbols='iec' ))
     assert not config.defaultPreemptable, 'User would be unable to reset config.defaultPreemptable'
     addOptionFn('--defaultPreemptable', dest='defaultPreemptable', action='store_true')
-    addOptionFn("--readGlobalFileMutableByDefault", dest="readGlobalFileMutableByDefault",
-                action='store_true', default=None, help='Toil disallows modification of read '
-                                                        'global files by default. This flag makes '
-                                                        'it makes read file mutable by default, '
-                                                        'however it also defeats the purpose of '
-                                                        'shared caching via hard links to save '
-                                                        'space. Default is False')
     addOptionFn('--maxCores', dest='maxCores', default=None, metavar='INT',
                 help='The maximum number of CPU cores to request from the batch system at any one '
                      'time. Standard suffixes like K, Ki, M, Mi, G or Gi are supported. Default '
@@ -493,16 +500,20 @@ def _addOptions(addGroupFn, config):
                             "the job may be longer). default=%s" % config.maxJobDuration))
     addOptionFn("--rescueJobsFrequency", dest="rescueJobsFrequency", default=None,
                       help=("Period of time to wait (in seconds) between checking for "
-                            "missing/overlong jobs, that is jobs which get lost by the batch system. Expert parameter. default=%s" % config.rescueJobsFrequency))
+                            "missing/overlong jobs, that is jobs which get lost by the batch "
+                            "system. Expert parameter. default=%s" % config.rescueJobsFrequency))
 
     #
     #Misc options
     #
-    addOptionFn = addGroupFn("toil miscellaneous options", "Miscellaneous options")
-    addOptionFn('--disableCaching', dest='disableCaching', action='store_true', default=False,
+    addOptionFn = addGroupFn("Toil Miscellaneous Options", "Miscellaneous Options")
+    addOptionFn('--disableCaching', dest='disableCaching', action='store_true', default=True,
                 help='Disables caching in the file store. This flag must be set to use '
                      'a batch system that does not support caching such as Grid Engine, Parasol, '
                      'LSF, or Slurm')
+    addOptionFn('--disableChaining', dest='disableChaining', action='store_true', default=False,
+                help="Disables chaining of jobs (chaining uses one job's resource allocation "
+                "for its successor job if possible).")
     addOptionFn("--maxLogFileSize", dest="maxLogFileSize", default=None,
                 help=("The maximum size of a job log file to keep (in bytes), log files "
                       "larger than this will be truncated to the last X bytes. Setting "
@@ -524,8 +535,8 @@ def _addOptions(addGroupFn, config):
                 help="Enable real-time logging from workers to masters")
 
     addOptionFn("--sseKey", dest="sseKey", default=None,
-            help="Path to file containing 32 character key to be used for server-side encryption on awsJobStore. SSE will "
-                 "not be used if this flag is not passed.")
+            help="Path to file containing 32 character key to be used for server-side encryption on "
+                 "awsJobStore or googleJobStore. SSE will not be used if this flag is not passed.")
     addOptionFn("--cseKey", dest="cseKey", default=None,
                 help="Path to file containing 256-bit key to be used for client-side encryption on "
                 "azureJobStore. By default, no encryption is used.")
@@ -539,10 +550,18 @@ def _addOptions(addGroupFn, config):
     addOptionFn("--servicePollingInterval", dest="servicePollingInterval", default=None,
                 help="Interval of time service jobs wait between polling for the existence"
                 " of the keep-alive flag (defailt=%s)" % config.servicePollingInterval)
+    addOptionFn('--forceDockerAppliance', dest='forceDockerAppliance', action='store_true',
+                default=False,
+                help='Disables sanity checking the existence of the docker image specified by '
+                'TOIL_APPLIANCE_SELF, which Toil uses to provision mesos for autoscaling.')
     #
     #Debug options
     #
     addOptionFn = addGroupFn("toil debug options", "Debug options")
+    addOptionFn("--debugWorker", default=False, action="store_true",
+            help="Experimental no forking mode for local debugging."
+                 " Specifically, workers are not forked and"
+                 " stderr/stdout are not redirected to the log.")
     addOptionFn("--badWorker", dest="badWorker", default=None,
                       help=("For testing purposes randomly kill 'badWorker' proportion of jobs using SIGKILL, default=%s" % config.badWorker))
     addOptionFn("--badWorkerFailInterval", dest="badWorkerFailInterval", default=None,
@@ -564,6 +583,60 @@ def addOptions(parser, config=Config()):
         raise RuntimeError("Unanticipated class passed to addOptions(), %s. Expecting "
                            "argparse.ArgumentParser" % parser.__class__)
 
+def getNodeID(extraIDFiles=None):
+    """
+    Return unique ID of the current node (host).
+    Tries several methods until success. The returned ID should be identical across calls from different processes on 
+    the same node at least until the next OS reboot.
+
+    The last resort method is uuid.getnode() that in some rare OS configurations may return a random ID each time it is
+    called. However, this method should never be reached on a Linux system, because reading from 
+    /proc/sys/kernel/random/boot_id will be tried prior to that. If uuid.getnode() is reached, it will be called twice,
+    and exception raised if the values are not identical.
+
+    :param list extraIDFiles: Optional list of additional file names to try reading node ID before trying default 
+    methods. ID should be a single word (no spaces) on the first line of the file.
+    """
+    if extraIDFiles is None:
+        extraIDFiles = []
+    idSourceFiles = extraIDFiles + ["/var/lib/dbus/machine-id", "/proc/sys/kernel/random/boot_id"]
+    for idSourceFile in idSourceFiles:
+        if os.path.exists(idSourceFile):
+            try:
+                with open(idSourceFile, "r") as inp:
+                    nodeID = inp.readline().strip()
+            except EnvironmentError:
+                logger.warning(("Exception when trying to read ID file {}. Will try next method to get node ID").\
+                        format(idSourceFile), exc_info=True)
+            else:
+                if len(nodeID.split()) == 1:
+                    logger.debug("Obtained node ID {} from file {}".format(nodeID,idSourceFile))
+                    break
+                else:
+                    logger.warning(("Node ID {} from file {} contains spaces. Will try next method to get node ID").\
+                            format(nodeID, idSourceFile))
+    else:
+        nodeIDs = []
+        for i_call in range(2):
+            nodeID = str(uuid.getnode()).strip()
+            if len(nodeID.split()) == 1:
+                nodeIDs.append(nodeID)
+            else:
+                logger.warning("Node ID {} from uuid.getnode() contains spaces".format(nodeID))
+        nodeID = ""
+        if len(nodeIDs) == 2:
+            if nodeIDs[0] == nodeIDs[1]:
+                nodeID = nodeIDs[0]
+            else:
+                logger.warning("Different node IDs {} received from repeated calls to uuid.getnode(). You should use "\
+                        "another method to generate node ID.".format(nodeIDs))
+
+            logger.debug("Obtained node ID {} from uuid.getnode()".format(nodeID))
+    if not nodeID:
+        logger.warning("Failed to generate stable node ID, returning empty string. If you see this message with a "\
+                "work dir on a shared file system when using workers running on multiple nodes, you might experience "\
+                "cryptic job failures")
+    return nodeID
 
 class Toil(object):
     """
@@ -633,9 +706,12 @@ class Toil(object):
             if (exc_type is not None and self.config.clean == "onError" or
                             exc_type is None and self.config.clean == "onSuccess" or
                         self.config.clean == "always"):
-                logger.info("Attempting to delete the job store")
-                self._jobStore.destroy()
-                logger.info("Successfully deleted the job store")
+                try:
+                    self._jobStore.destroy()
+                    logger.info("Successfully deleted the job store: %s" % str(self._jobStore))
+                except:
+                    logger.info("Failed to delete the job store: %s" % str(self._jobStore))
+                    raise
         except Exception as e:
             if exc_type is None:
                 raise
@@ -659,7 +735,7 @@ class Toil(object):
                                        'Toil.restart() to resume it.')
 
         self._batchSystem = self.createBatchSystem(self.config)
-        self._setupHotDeployment(rootJob.getUserScript())
+        self._setupAutoDeployment(rootJob.getUserScript())
         try:
             self._setBatchSystemEnvVars()
             self._serialiseEnv()
@@ -672,7 +748,7 @@ class Toil(object):
             with self._jobStore.writeSharedFileStream('rootJobReturnValue') as fH:
                 rootJob.prepareForPromiseRegistration(self._jobStore)
                 promise = rootJob.rv()
-                cPickle.dump(promise, fH, protocol=cPickle.HIGHEST_PROTOCOL)
+                pickle.dump(promise, fH, protocol=pickle.HIGHEST_PROTOCOL)
 
             # Setup the first wrapper and cache it
             rootJobGraph = rootJob._serialiseFirstJob(self._jobStore)
@@ -685,8 +761,7 @@ class Toil(object):
 
     def restart(self):
         """
-        Restarts a workflow that has been interrupted. This method should be called if and only
-        if a workflow has previously been started and has not finished.
+        Restarts a workflow that has been interrupted.
 
         :return: The root job's return value
         """
@@ -695,8 +770,15 @@ class Toil(object):
             raise ToilRestartException('A Toil workflow must be initiated with Toil.start(), '
                                        'not restart().')
 
+        from toil.job import JobException
+        try:
+            self._jobStore.loadRootJob()
+        except JobException:
+            logger.warning('Requested restart but the workflow has already been completed; allowing exports to rerun.')
+            return self._jobStore.getRootJobReturnValue()
+
         self._batchSystem = self.createBatchSystem(self.config)
-        self._setupHotDeployment()
+        self._setupAutoDeployment()
         try:
             self._setBatchSystemEnvVars()
             self._serialiseEnv()
@@ -710,15 +792,13 @@ class Toil(object):
     def _setProvisioner(self):
         if self.config.provisioner is None:
             self._provisioner = None
-        elif self.config.provisioner == 'aws':
-            logger.info('Using AWS provisioner.')
-            from bd2k.util.ec2.credentials import enable_metadata_credential_caching
-            from toil.provisioners.aws.awsProvisioner import AWSProvisioner
-            enable_metadata_credential_caching()
-            self._provisioner = AWSProvisioner(self.config, self._batchSystem)
         else:
-            # Command line parser shold have checked argument validity already
-            assert False, self.config.provisioner
+            self._provisioner = clusterFactory(provisioner=self.config.provisioner,
+                                               clusterName=None,
+                                               zone=None, # read from instance meta-data
+                                               nodeStorage=self.config.nodeStorage,
+                                               sseKey=self.config.sseKey)
+            self._provisioner.setAutoscaledNodeTypes(self.config.nodeTypes)
 
     @classmethod
     def getJobStore(cls, locator):
@@ -744,8 +824,7 @@ class Toil(object):
             return AzureJobStore(rest)
         elif name == 'google':
             from toil.jobStores.googleJobStore import GoogleJobStore
-            projectID, namePrefix = rest.split(':', 1)
-            return GoogleJobStore(namePrefix, projectID)
+            return GoogleJobStore(rest)
         else:
             raise RuntimeError("Unknown job store implementation '%s'" % name)
 
@@ -788,37 +867,12 @@ class Toil(object):
                       maxMemory=config.maxMemory,
                       maxDisk=config.maxDisk)
 
-        if config.batchSystem == 'parasol':
-            from toil.batchSystems.parasol import ParasolBatchSystem
-            batchSystemClass = ParasolBatchSystem
+        from toil.batchSystems.registry import batchSystemFactoryFor
 
-        elif config.batchSystem == 'single_machine' or config.batchSystem == 'singleMachine':
-            from toil.batchSystems.singleMachine import SingleMachineBatchSystem
-            batchSystemClass = SingleMachineBatchSystem
-
-        elif config.batchSystem == 'gridengine' or config.batchSystem == 'gridEngine':
-            from toil.batchSystems.gridengine import GridEngineBatchSystem
-            batchSystemClass = GridEngineBatchSystem
-
-        elif config.batchSystem == 'lsf' or config.batchSystem == 'LSF':
-            from toil.batchSystems.lsf import LSFBatchSystem
-            batchSystemClass = LSFBatchSystem
-
-        elif config.batchSystem == 'mesos' or config.batchSystem == 'Mesos':
-            from toil.batchSystems.mesos.batchSystem import MesosBatchSystem
-            batchSystemClass = MesosBatchSystem
-
-            kwargs['masterAddress'] = config.mesosMasterAddress
-
-        elif config.batchSystem == 'slurm' or config.batchSystem == 'Slurm':
-            from toil.batchSystems.slurm import SlurmBatchSystem
-            batchSystemClass = SlurmBatchSystem
-
-        elif config.batchSystem == 'torque' or config.batchSystem == 'Torque':
-            from toil.batchSystems.torque import TorqueBatchSystem
-            batchSystemClass = TorqueBatchSystem
-
-        else:
+        try:
+            factory = batchSystemFactoryFor(config.batchSystem)
+            batchSystemClass = factory()
+        except:
             raise RuntimeError('Unrecognised batch system: %s' % config.batchSystem)
 
         if not config.disableCaching and not batchSystemClass.supportsWorkerCleanup():
@@ -830,10 +884,10 @@ class Toil(object):
 
         return batchSystemClass(**kwargs)
 
-    def _setupHotDeployment(self, userScript=None):
+    def _setupAutoDeployment(self, userScript=None):
         """
         Determine the user script, save it to the job store and inject a reference to the saved
-        copy into the batch system such that it can hot-deploy the resource on the worker
+        copy into the batch system such that it can auto-deploy the resource on the worker
         nodes.
 
         :param toil.resource.ModuleDescriptor userScript: the module descriptor referencing the
@@ -842,19 +896,19 @@ class Toil(object):
         if userScript is not None:
             # This branch is hit when a workflow is being started
             if userScript.belongsToToil:
-                logger.info('User script %s belongs to Toil. No need to hot-deploy it.', userScript)
+                logger.info('User script %s belongs to Toil. No need to auto-deploy it.', userScript)
                 userScript = None
             else:
-                if (self._batchSystem.supportsHotDeployment() and
-                        not self.config.disableHotDeployment):
+                if (self._batchSystem.supportsAutoDeployment() and
+                        not self.config.disableAutoDeployment):
                     # Note that by saving the ModuleDescriptor, and not the Resource we allow for
                     # redeploying a potentially modified user script on workflow restarts.
                     with self._jobStore.writeSharedFileStream('userScript') as f:
-                        cPickle.dump(userScript, f, protocol=cPickle.HIGHEST_PROTOCOL)
+                        pickle.dump(userScript, f, protocol=pickle.HIGHEST_PROTOCOL)
                 else:
                     from toil.batchSystems.singleMachine import SingleMachineBatchSystem
                     if not isinstance(self._batchSystem, SingleMachineBatchSystem):
-                        logger.warn('Batch system does not support hot-deployment. The user '
+                        logger.warn('Batch system does not support auto-deployment. The user '
                                     'script %s will have to be present at the same location on '
                                     'every worker.', userScript)
                     userScript = None
@@ -863,50 +917,35 @@ class Toil(object):
             from toil.jobStores.abstractJobStore import NoSuchFileException
             try:
                 with self._jobStore.readSharedFileStream('userScript') as f:
-                    userScript = cPickle.load(f)
+                    userScript = safeUnpickleFromStream(f)
             except NoSuchFileException:
                 logger.info('User script neither set explicitly nor present in the job store.')
                 userScript = None
         if userScript is None:
-            logger.info('No user script to hot-deploy.')
+            logger.info('No user script to auto-deploy.')
         else:
             logger.debug('Saving user script %s as a resource', userScript)
             userScriptResource = userScript.saveAsResourceTo(self._jobStore)
             logger.debug('Injecting user script %s into batch system.', userScriptResource)
             self._batchSystem.setUserScript(userScriptResource)
-            thread = Thread(target=self._refreshUserScript,
-                            name='refreshUserScript',
-                            kwargs=dict(userScriptResource=userScriptResource))
-            thread.daemon = True
-            thread.start()
-
-    def _refreshUserScript(self, userScriptResource):
-        """
-        Periodically refresh the user script in the job store to prevent credential
-        expiration from causing the public URL to the user script to expire.
-        """
-        while True:
-            # Boto refreshes IAM credentials if they will be expiring within the next five
-            # minutes, but it will only check the expiry if and when credentials are needed to
-            # sign an actual AWS request. This means that we should be refreshing the user script
-            # at least every 5 minutes. Note that refreshing the user script in the job store
-            # involves an S3 request requiring credentials and therefore also triggers refreshing
-            # the IAM role credentials. In the worst case, refresh() is called 5 minutes plus
-            # epsilon before IAM credential expiration. The resource is refreshed three minutes
-            # after that, leaving two minutes plus epsilon generating a new signed URL, this time
-            # with refreshed IAM role credentials. This consideration only applies to AWS and
-            # Boto2, of course. See https://github.com/BD2KGenomics/toil/issues/1372.
-            time.sleep(3 * 60)
-            logger.debug('Refreshing user script resource %s.', userScriptResource)
-            userScriptResource = userScriptResource.refresh(self._jobStore)
-            logger.debug('Injecting refreshed user script %s into batch system.', userScriptResource)
-            self._batchSystem.setUserScript(userScriptResource)
 
     def importFile(self, srcUrl, sharedFileName=None):
+        """
+        Imports the file at the given URL into job store.
+
+        See :func:`toil.jobStores.abstractJobStore.AbstractJobStore.importFile` for a
+        full description
+        """
         self._assertContextManagerUsed()
         return self._jobStore.importFile(srcUrl, sharedFileName=sharedFileName)
 
     def exportFile(self, jobStoreFileID, dstUrl):
+        """
+        Exports file to destination pointed at by the destination URL.
+
+        See :func:`toil.jobStores.abstractJobStore.AbstractJobStore.exportFile` for a
+        full description
+        """
         self._assertContextManagerUsed()
         self._jobStore.exportFile(jobStoreFileID, dstUrl)
 
@@ -924,7 +963,7 @@ class Toil(object):
         """
         # Dump out the environment of this process in the environment pickle file.
         with self._jobStore.writeSharedFileStream("environment.pickle") as fileHandle:
-            cPickle.dump(os.environ, fileHandle, cPickle.HIGHEST_PROTOCOL)
+            pickle.dump(os.environ, fileHandle, pickle.HIGHEST_PROTOCOL)
         logger.info("Written the environment for the jobs to the environment file")
 
     def _cacheAllJobs(self):
@@ -958,8 +997,9 @@ class Toil(object):
         if not os.path.exists(workDir):
             raise RuntimeError("The directory specified by --workDir or TOIL_WORKDIR (%s) does not "
                                "exist." % workDir)
-        # Create the workflow dir
-        workflowDir = os.path.join(workDir, 'toil-%s' % workflowID)
+        # Create the workflow dir, make it unique to each host in case workDir is on a shared FS.
+        # This prevents workers on different nodes from erasing each other's directories.
+        workflowDir = os.path.join(workDir, 'toil-%s-%s' % (workflowID, getNodeID()))
         try:
             # Directory creation is atomic
             os.mkdir(workflowDir)
@@ -1006,7 +1046,6 @@ class Toil(object):
         if not self._inContextManager:
             raise ToilContextManagerException()
 
-
 class ToilRestartException(Exception):
     def __init__(self, message):
         super(ToilRestartException, self).__init__(message)
@@ -1016,6 +1055,150 @@ class ToilContextManagerException(Exception):
     def __init__(self):
         super(ToilContextManagerException, self).__init__(
             'This method cannot be called outside the "with Toil(...)" context manager.')
+
+
+class ToilMetrics:
+    def __init__(self, provisioner=None):
+        if provisioner is not None:
+            self.clusterName = provisioner.clusterName
+        else:
+            self.clusterName = "none"
+
+        registry = lookupEnvVar(name='docker registry',
+                                envName='TOIL_DOCKER_REGISTRY',
+                                defaultValue=dockerRegistry)
+
+        self.mtailImage = "%s/toil-mtail:%s" % (registry, dockerTag)
+        self.grafanaImage = "%s/toil-grafana:%s" % (registry, dockerTag)
+        self.prometheusImage = "%s/toil-prometheus:%s" % (registry, dockerTag)
+
+        self.startDashboard(clusterName = self.clusterName)
+
+        # Always restart the mtail container, because metrics should start from scratch
+        # for each workflow
+        try:
+            subprocess.check_call(["docker", "rm", "-f", "toil_mtail"])
+        except subprocess.CalledProcessError:
+            pass
+
+        try:
+            self.mtailProc = subprocess.Popen(["docker", "run", "--rm", "--interactive",
+                                               "--net=host",
+                                               "--name", "toil_mtail",
+                                               "-p", "3903:3903",
+                                               self.mtailImage],
+                                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        except subprocess.CalledProcessError:
+            logger.warn("Could not start toil metrics server.")
+            self.mtailProc = None
+        except KeyboardInterrupt:
+            self.mtailProc.terminate()
+
+        # On single machine, launch a node exporter instance to monitor CPU/RAM usage.
+        # On AWS this is handled by the EC2 init script
+        self.nodeExporterProc = None
+        if not provisioner:
+            try:
+                self.nodeExporterProc = subprocess.Popen(["docker", "run", "--rm",
+                                                          "--net=host",
+                                                          "-p", "9100:9100",
+                                                          "-v", "/proc:/host/proc",
+                                                          "-v", "/sys:/host/sys",
+                                                          "-v", "/:/rootfs",
+                                                          "prom/node-exporter:0.12.0",
+                                                          "-collector.procfs", "/host/proc",
+                                                          "-collector.sysfs", "/host/sys",
+                                                          "-collector.filesystem.ignored-mount-points",
+                                                          "^/(sys|proc|dev|host|etc)($|/)"])
+            except subprocess.CalledProcessError:
+                logger.warn("Couldn't start node exporter, won't get RAM and CPU usage for dashboard.")
+                self.nodeExporterProc = None
+            except KeyboardInterrupt:
+                self.nodeExporterProc.terminate()
+
+    @staticmethod
+    def _containerRunning(containerName):
+        try:
+            result = subprocess.check_output(["docker", "inspect", "-f",
+                                                          "'{{.State.Running}}'", containerName]) == "true"
+        except subprocess.CalledProcessError:
+            result = False
+        return result
+
+    def startDashboard(self, clusterName):
+        try:
+            if not self._containerRunning("toil_prometheus"):
+                try:
+                    subprocess.check_call(["docker", "rm", "-f", "toil_prometheus"])
+                except subprocess.CalledProcessError:
+                    pass
+                subprocess.check_call(["docker", "run",
+                                 "--name", "toil_prometheus",
+                                 "--net=host",
+                                 "-d",
+                                 "-p", "9090:9090",
+                                 self.prometheusImage,
+                                 clusterName])
+
+            if not self._containerRunning("toil_grafana"):
+                try:
+                    subprocess.check_call(["docker", "rm", "-f", "toil_grafana"])
+                except subprocess.CalledProcessError:
+                    pass
+                subprocess.check_call(["docker", "run",
+                                 "--name", "toil_grafana",
+                                 "-d", "-p=3000:3000",
+                                 self.grafanaImage])
+        except subprocess.CalledProcessError:
+            logger.warn("Could not start prometheus/grafana dashboard.")
+            return
+
+        #Add prometheus data source
+        def requestPredicate(e):
+            if isinstance(e, requests.exceptions.ConnectionError):
+                return True
+            return False
+        try:
+            for attempt in retry(delays=(0, 1, 1, 4, 16), predicate=requestPredicate):
+                with attempt:
+                    requests.post('http://localhost:3000/api/datasources', auth=('admin','admin'),
+                                  data='{"name":"DS_PROMETHEUS","type":"prometheus", \
+                                  "url":"http://localhost:9090", "access":"direct"}',
+                                  headers = {'content-type': 'application/json', "access": "direct"})
+        except requests.exceptions.ConnectionError:
+            logger.info("Could not add data source to Grafana dashboard - no metrics will be displayed.")
+
+    def log(self, message):
+        if self.mtailProc:
+            self.mtailProc.stdin.write(message + "\n")
+
+    # Note: The mtail configuration (dashboard/mtail/toil.mtail) depends on these messages
+    # remaining intact
+
+    def logMissingJob(self):
+        self.log("missing_job")
+
+    def logClusterSize(self, nodeType, currentSize, desiredSize):
+        self.log("current_size '%s' %i" % (nodeType, currentSize))
+        self.log("desired_size '%s' %i" % (nodeType, desiredSize))
+
+    def logQueueSize(self, queueSize):
+        self.log("queue_size %i" % queueSize)
+
+    def logIssuedJob(self, jobType):
+        self.log("issued_job %s" % jobType)
+
+    def logFailedJob(self, jobType):
+        self.log("failed_job %s" % jobType)
+
+    def logCompletedJob(self, jobType):
+        self.log("completed_job %s" % jobType)
+
+    def shutdown(self):
+        if self.mtailProc:
+            self.mtailProc.kill()
+        if self.nodeExporterProc:
+            self.nodeExporterProc.kill()
 
 # Nested functions can't have doctests so we have to make this global
 
@@ -1063,6 +1246,21 @@ def parseSetEnv(l):
     return d
 
 
+def iC(minValue, maxValue=sys.maxsize):
+    # Returns function that checks if a given int is in the given half-open interval
+    assert isinstance(minValue, int) and isinstance(maxValue, int)
+    return lambda x: minValue <= x < maxValue
+
+def fC(minValue, maxValue=None):
+    # Returns function that checks if a given float is in the given half-open interval
+    assert isinstance(minValue, float)
+    if maxValue is None:
+        return lambda x: minValue <= x
+    else:
+        assert isinstance(maxValue, float)
+        return lambda x: minValue <= x < maxValue
+
+
 def cacheDirName(workflowID):
     """
     :return: Name of the cache directory.
@@ -1072,33 +1270,29 @@ def cacheDirName(workflowID):
 
 def getDirSizeRecursively(dirPath):
     """
-    This method will walk through a directory and return the cumulative filesize in bytes of all
-    the files in the directory and its subdirectories.
+    This method will return the cumulative number of bytes occupied by the files 
+    on disk in the directory and its subdirectories.
 
-    :param dirPath: Path to a directory.
-    :return: cumulative size in bytes of all files in the directory.
-    :rtype: int
+    This method will raise a 'subprocess.CalledProcessError' if it is unable to
+    access a folder or file because of insufficient permissions.  Therefore this 
+    method should only be called on the jobStore, and will alert the user if some 
+    portion is inaccessible.  Everything in the jobStore should have appropriate 
+    permissions as there is no way to read the filesize without permissions.
+    
+    The environment variable 'BLOCKSIZE'='512' is set instead of the much cleaner
+    --block-size=1 because Apple can't handle it.
+
+    :param str dirPath: A valid path to a directory or file.
+    :return: Total size, in bytes, of the file or directory at dirPath.
     """
-    totalSize = 0
-    # The value from running stat on each linked file is equal. To prevent the same file
-    # from being counted multiple times, we save the inodes of files that have more than one
-    # nlink associated with them.
-    seenInodes = set()
-    for dirPath, dirNames, fileNames in os.walk(dirPath):
-        folderSize = 0
-        for f in fileNames:
-            fp = os.path.join(dirPath, f)
-            fileStats = os.stat(fp)
-            if fileStats.st_nlink > 1:
-                if fileStats.st_ino not in seenInodes:
-                    folderSize += fileStats.st_blocks * unixBlockSize
-                    seenInodes.add(fileStats.st_ino)
-                else:
-                    continue
-            else:
-                folderSize += fileStats.st_blocks * unixBlockSize
-        totalSize += folderSize
-    return totalSize
+    
+    # du is often faster than using os.lstat(), sometimes significantly so.
+    
+    # The call: 'du -s /some/path' should give the number of 512-byte blocks
+    # allocated with the environment variable: BLOCKSIZE='512' set, and we
+    # multiply this by 512 to return the filesize in bytes.
+    return int(subprocess.check_output(['du', '-s', dirPath],
+               env=dict(os.environ, BLOCKSIZE='512')).split()[0].decode('ascii')) * 512
 
 
 def getFileSystemSize(dirPath):
@@ -1114,3 +1308,7 @@ def getFileSystemSize(dirPath):
     freeSpace = diskStats.f_frsize * diskStats.f_bavail
     diskSize = diskStats.f_frsize * diskStats.f_blocks
     return freeSpace, diskSize
+
+def safeUnpickleFromStream(stream):
+    string = stream.read()
+    return pickle.loads(string)

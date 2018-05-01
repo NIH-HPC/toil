@@ -41,13 +41,11 @@ def heredoc(s):
 
 motd = heredoc('''
 
-    This is the Toil appliance. You can run your Toil script directly on the appliance, but only
-    in single-machine mode. Alternatively, create a Toil cluster with `toil launch-cluster`,
-    log into the leader of that cluster with `toil ssh-cluster` and run your Toil script there.
-
+    This is the Toil appliance. You can run your Toil script directly on the appliance. 
+    Run toil <workflow>.py --help to see all options for running your workflow.
     For more information see http://toil.readthedocs.io/en/latest/
 
-    Copyright (C) 2015-2016 Regents of the University of California
+    Copyright (C) 2015-2018 Regents of the University of California
 
     Version: {applianceSelf}
 
@@ -77,7 +75,10 @@ print(heredoc('''
     RUN chmod 777 /usr/bin/waitForKey.sh
 
     # The stock pip is too old and can't install from sdist with extras
-    RUN pip install --upgrade pip==8.1.2
+    RUN pip install --upgrade pip==9.0.1
+
+    # Default setuptools is too old
+    RUN pip install --upgrade setuptools==36.5.0
 
     # Include virtualenv, as it is still the recommended way to deploy pipelines
     RUN pip install --upgrade virtualenv==15.0.3
@@ -88,7 +89,7 @@ print(heredoc('''
         && ln -s /home/s3am/bin/s3am /usr/local/bin/
 
     # Install statically linked version of docker client
-    RUN curl https://get.docker.com/builds/Linux/x86_64/docker-1.12.3.tgz \
+    RUN curl https://get.docker.com/builds/Linux/x86_64/docker-1.13.1.tgz \
          | tar -xvzf - --transform='s,[^/]*/,,g' -C /usr/local/bin/ \
          && chmod u+x /usr/local/bin/docker
 
@@ -114,7 +115,7 @@ print(heredoc('''
 
     # This component changes most frequently and keeping it last maximizes Docker cache hits.
     COPY {sdistName} .
-    RUN pip install {sdistName}[aws,mesos,encryption,cwl]
+    RUN pip install {sdistName}[all]
     RUN rm {sdistName}
 
     # We intentionally inherit the default ENTRYPOINT and CMD from the base image, to the effect

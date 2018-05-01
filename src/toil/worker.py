@@ -13,6 +13,11 @@
 # limitations under the License.
 
 from __future__ import absolute_import, print_function
+from future import standard_library
+standard_library.install_aliases()
+from builtins import str
+from builtins import map
+from builtins import filter
 import os
 import sys
 import copy
@@ -27,82 +32,90 @@ import logging
 import shutil
 from threading import Thread
 
-# Python 3 compatibility imports
-from six.moves import cPickle
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 
-from bd2k.util.expando import Expando, MagicExpando
-from toil.common import Toil
+from bd2k.util.expando import MagicExpando
+from toil.common import Toil, safeUnpickleFromStream
 from toil.fileStore import FileStore
 from toil import logProcessContext
+from toil.job import Job
+from toil.lib.bioio import setLogLevel
+from toil.lib.bioio import getTotalCpuTime
+from toil.lib.bioio import getTotalCpuTimeAndMemoryUsage
 import signal
 
-logger = logging.getLogger( __name__ )
+logger = logging.getLogger(__name__)
 
-
-
-
-def nextOpenDescriptor():
-    """Gets the number of the next available file descriptor.
+def nextChainableJobGraph(jobGraph, jobStore):
+    """Returns the next chainable jobGraph after this jobGraph if one
+    exists, or None if the chain must terminate.
     """
-    descriptor = os.open("/dev/null", os.O_RDONLY)
-    os.close(descriptor)
-    return descriptor
+    #If no more jobs to run or services not finished, quit
+    if len(jobGraph.stack) == 0 or len(jobGraph.services) > 0 or jobGraph.checkpoint != None:
+        logger.debug("Stopping running chain of jobs: length of stack: %s, services: %s, checkpoint: %s",
+                     len(jobGraph.stack), len(jobGraph.services), jobGraph.checkpoint != None)
+        return None
 
-class AsyncJobStoreWrite:
-    def __init__(self, jobStore):
-        pass
-    
-    def writeFile(self, filePath):
-        pass
-    
-    def writeFileStream(self):
-        pass
-    
-    def blockUntilSync(self):
-        pass
+    #Get the next set of jobs to run
+    jobs = jobGraph.stack[-1]
+    assert len(jobs) > 0
 
-def main():
+    #If there are 2 or more jobs to run in parallel we quit
+    if len(jobs) >= 2:
+        logger.debug("No more jobs can run in series by this worker,"
+                    " it's got %i children", len(jobs)-1)
+        return None
+
+    #We check the requirements of the jobGraph to see if we can run it
+    #within the current worker
+    successorJobNode = jobs[0]
+    if successorJobNode.memory > jobGraph.memory:
+        logger.debug("We need more memory for the next job, so finishing")
+        return None
+    if successorJobNode.cores > jobGraph.cores:
+        logger.debug("We need more cores for the next job, so finishing")
+        return None
+    if successorJobNode.disk > jobGraph.disk:
+        logger.debug("We need more disk for the next job, so finishing")
+        return None
+    if successorJobNode.preemptable != jobGraph.preemptable:
+        logger.debug("Preemptability is different for the next job, returning to the leader")
+        return None
+    if successorJobNode.predecessorNumber > 1:
+        logger.debug("The jobGraph has multiple predecessors, we must return to the leader.")
+        return None
+
+    # Load the successor jobGraph
+    successorJobGraph = jobStore.load(successorJobNode.jobStoreID)
+
+    # Somewhat ugly, but check if job is a checkpoint job and quit if
+    # so
+    if successorJobGraph.command.startswith( "_toil " ):
+        #Load the job
+        successorJob = Job._loadJob(successorJobGraph.command, jobStore)
+
+        # Check it is not a checkpoint
+        if successorJob.checkpoint:
+            logger.debug("Next job is checkpoint, so finishing")
+            return None
+
+    # Made it through! This job is chainable.
+    return successorJobGraph
+
+def workerScript(jobStore, config, jobName, jobStoreID, redirectOutputToLogFile=True):
+    """
+    Worker process script, runs a job. 
+    
+    :param str jobName: The "job name" (a user friendly name) of the job to be run
+    :param str jobStoreLocator: Specifies the job store to use
+    :param str jobStoreID: The job store ID of the job to be run
+    :param bool redirectOutputToLogFile: Redirect standard out and standard error to a log file
+    """
     logging.basicConfig()
 
-    ##########################################
-    #Import necessary modules 
-    ##########################################
-    
-    # This is assuming that worker.py is at a path ending in "/toil/worker.py".
-    sourcePath = os.path.dirname(os.path.dirname(__file__))
-    if sourcePath not in sys.path:
-        sys.path.append(sourcePath)
-    
-    #Now we can import all the necessary functions
-    from toil.lib.bioio import setLogLevel
-    from toil.lib.bioio import getTotalCpuTime
-    from toil.lib.bioio import getTotalCpuTimeAndMemoryUsage
-    from toil.job import Job
-    try:
-        import boto
-    except ImportError:
-        pass
-    else:
-        # boto is installed, monkey patch it now
-        from bd2k.util.ec2.credentials import enable_metadata_credential_caching
-        enable_metadata_credential_caching()
-    ##########################################
-    #Input args
-    ##########################################
-    
-    jobStoreLocator = sys.argv[1]
-    jobStoreID = sys.argv[2]
-    # we really want a list of job names but the ID will suffice if the job graph can't
-    # be loaded. If we can discover the name, we will replace this initial entry
-    listOfJobs = [jobStoreID]
-    
-    ##########################################
-    #Load the jobStore/config file
-    ##########################################
-    
-    jobStore = Toil.resumeJobStore(jobStoreLocator)
-    config = jobStore.config
-    
     ##########################################
     #Create the worker killer, if requested
     ##########################################
@@ -132,7 +145,7 @@ def main():
     
     #First load the environment for the jobGraph.
     with jobStore.readSharedFileStream("environment.pickle") as fileHandle:
-        environment = cPickle.load(fileHandle)
+        environment = safeUnpickleFromStream(fileHandle)
     for i in environment:
         if i not in ("TMPDIR", "TMP", "HOSTNAME", "HOSTTYPE"):
             os.environ[i] = environment[i]
@@ -169,29 +182,30 @@ def main():
 
     #What file do we want to point FDs 1 and 2 to?
     tempWorkerLogPath = os.path.join(localWorkerTempDir, "worker_log.txt")
-    
-    #Save the original stdout and stderr (by opening new file descriptors to the
-    #same files)
-    origStdOut = os.dup(1)
-    origStdErr = os.dup(2)
 
-    #Open the file to send stdout/stderr to.
-    logFh = os.open(tempWorkerLogPath, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    if redirectOutputToLogFile:
+        # Save the original stdout and stderr (by opening new file descriptors
+        # to the same files)
+        origStdOut = os.dup(1)
+        origStdErr = os.dup(2)
 
-    #Replace standard output with a descriptor for the log file
-    os.dup2(logFh, 1)
-    
-    #Replace standard error with a descriptor for the log file
-    os.dup2(logFh, 2)
-    
-    #Since we only opened the file once, all the descriptors duped from the
-    #original will share offset information, and won't clobber each others'
-    #writes. See <http://stackoverflow.com/a/5284108/402891>. This shouldn't
-    #matter, since O_APPEND seeks to the end of the file before every write, but
-    #maybe there's something odd going on...
-    
-    #Close the descriptor we used to open the file
-    os.close(logFh)
+        # Open the file to send stdout/stderr to.
+        logFh = os.open(tempWorkerLogPath, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+
+        # Replace standard output with a descriptor for the log file
+        os.dup2(logFh, 1)
+
+        # Replace standard error with a descriptor for the log file
+        os.dup2(logFh, 2)
+
+        # Since we only opened the file once, all the descriptors duped from
+        # the original will share offset information, and won't clobber each
+        # others' writes. See <http://stackoverflow.com/a/5284108/402891>. This
+        # shouldn't matter, since O_APPEND seeks to the end of the file before
+        # every write, but maybe there's something odd going on...
+
+        # Close the descriptor we used to open the file
+        os.close(logFh)
 
     debugging = logging.getLogger().isEnabledFor(logging.DEBUG)
     ##########################################
@@ -203,18 +217,13 @@ def main():
     statsDict.jobs = []
     statsDict.workers.logsToMaster = []
     blockFn = lambda : True
-    cleanCacheFn = lambda x : True
+    listOfJobs = [jobName]
     try:
 
         #Put a message at the top of the log, just to make sure it's working.
-        print("---TOIL WORKER OUTPUT LOG---")
+        logger.info("---TOIL WORKER OUTPUT LOG---")
         sys.stdout.flush()
         
-        #Log the number of open file descriptors so we can tell if we're leaking
-        #them.
-        logger.debug("Next available file descriptor: {}".format(
-            nextOpenDescriptor()))
-
         logProcessContext(config)
 
         ##########################################
@@ -223,16 +232,16 @@ def main():
         
         jobGraph = jobStore.load(jobStoreID)
         listOfJobs[0] = str(jobGraph)
-        logger.debug("Parsed jobGraph")
+        logger.debug("Parsed job wrapper")
         
         ##########################################
         #Cleanup from any earlier invocation of the jobGraph
         ##########################################
         
         if jobGraph.command == None:
+            logger.debug("Wrapper has no user job to run.")
             # Cleanup jobs already finished
-            f = lambda jobs : filter(lambda x : len(x) > 0, map(lambda x :
-                                    filter(lambda y : jobStore.exists(y.jobStoreID), x), jobs))
+            f = lambda jobs : [z for z in [[y for y in x if jobStore.exists(y.jobStoreID)] for x in jobs] if len(z) > 0]
             jobGraph.stack = f(jobGraph.stack)
             jobGraph.services = f(jobGraph.services)
             logger.debug("Cleaned up any references to completed successor jobs")
@@ -252,65 +261,29 @@ def main():
         # The job is a checkpoint, and is being restarted after previously completing
         if jobGraph.checkpoint != None:
             logger.debug("Job is a checkpoint")
-            if len(jobGraph.stack) > 0 or len(jobGraph.services) > 0 or jobGraph.command != None:
-                if jobGraph.command != None:
-                    assert jobGraph.command == jobGraph.checkpoint
-                    logger.debug("Checkpoint job already has command set to run")
-                else:
-                    jobGraph.command = jobGraph.checkpoint
-
+            # If the checkpoint still has extant jobs in its
+            # (flattened) stack and services, its subtree didn't
+            # complete properly. We handle the restart of the
+            # checkpoint here, removing its previous subtree.
+            if len([i for l in jobGraph.stack for i in l]) > 0 or len(jobGraph.services) > 0:
+                logger.debug("Checkpoint has failed.")
                 # Reduce the retry count
                 assert jobGraph.remainingRetryCount >= 0
                 jobGraph.remainingRetryCount = max(0, jobGraph.remainingRetryCount - 1)
-
-                jobStore.update(jobGraph) # Update immediately to ensure that checkpoint
-                # is made before deleting any remaining successors
-
-                if len(jobGraph.stack) > 0 or len(jobGraph.services) > 0:
-                    # If the subtree of successors is not complete restart everything
-                    logger.debug("Checkpoint job has unfinished successor jobs, deleting the jobs on the stack: %s, services: %s " %
-                                 (jobGraph.stack, jobGraph.services))
-
-                    # Delete everything on the stack, as these represent successors to clean
-                    # up as we restart the queue
-                    def recursiveDelete(jobGraph2):
-                        # Recursive walk the stack to delete all remaining jobs
-                        for jobs in jobGraph2.stack + jobGraph2.services:
-                            for jobNode in jobs:
-                                if jobStore.exists(jobNode.jobStoreID):
-                                    recursiveDelete(jobStore.load(jobNode.jobStoreID))
-                                else:
-                                    logger.debug("Job %s has already been deleted", jobNode)
-                        if jobGraph2 != jobGraph:
-                            logger.debug("Checkpoint is deleting old successor job: %s", jobGraph2.jobStoreID)
-                            jobStore.delete(jobGraph2.jobStoreID)
-                    recursiveDelete(jobGraph)
-
-                    jobGraph.stack = [ [], [] ] # Initialise the job to mimic the state of a job
-                    # that has been previously serialised but which as yet has no successors
-
-                    jobGraph.services = [] # Empty the services
-
-                    # Update the jobStore to avoid doing this twice on failure and make this clean.
-                    jobStore.update(jobGraph)
-
+                jobGraph.restartCheckpoint(jobStore)
             # Otherwise, the job and successors are done, and we can cleanup stuff we couldn't clean
             # because of the job being a checkpoint
             else:
                 logger.debug("The checkpoint jobs seems to have completed okay, removing any checkpoint files to delete.")
                 #Delete any remnant files
-                map(jobStore.deleteFile, filter(jobStore.fileExists, jobGraph.checkpointFilesToDelete))
+                list(map(jobStore.deleteFile, list(filter(jobStore.fileExists, jobGraph.checkpointFilesToDelete))))
 
         ##########################################
         #Setup the stats, if requested
         ##########################################
         
         if config.stats:
-            startTime = time.time()
             startClock = getTotalCpuTime()
-
-        #Make a temporary file directory for the jobGraph
-        #localTempDir = makePublicDir(os.path.join(localWorkerTempDir, "localTempDir"))
 
         startTime = time.time()
         while True:
@@ -346,6 +319,7 @@ def main():
                 #The command may be none, in which case
                 #the jobGraph is either a shell ready to be deleted or has
                 #been scheduled after a failure to cleanup
+                logger.debug("No user job to run, so finishing")
                 break
             
             if FileStore._terminateEvent.isSet():
@@ -354,58 +328,10 @@ def main():
             ##########################################
             #Establish if we can run another jobGraph within the worker
             ##########################################
-            
-            #If no more jobs to run or services not finished, quit
-            if len(jobGraph.stack) == 0 or len(jobGraph.services) > 0 or jobGraph.checkpoint != None:
-                logger.debug("Stopping running chain of jobs: length of stack: %s, services: %s, checkpoint: %s",
-                             len(jobGraph.stack), len(jobGraph.services), jobGraph.checkpoint != None)
+            successorJobGraph = nextChainableJobGraph(jobGraph, jobStore)
+            if successorJobGraph is None or config.disableChaining:
+                # Can't chain any more jobs.
                 break
-            
-            #Get the next set of jobs to run
-            jobs = jobGraph.stack[-1]
-            assert len(jobs) > 0
-            
-            #If there are 2 or more jobs to run in parallel we quit
-            if len(jobs) >= 2:
-                logger.debug("No more jobs can run in series by this worker,"
-                            " it's got %i children", len(jobs)-1)
-                break
-            
-            #We check the requirements of the jobGraph to see if we can run it
-            #within the current worker
-            successorJobNode = jobs[0]
-            if successorJobNode.memory > jobGraph.memory:
-                logger.debug("We need more memory for the next job, so finishing")
-                break
-            if successorJobNode.cores > jobGraph.cores:
-                logger.debug("We need more cores for the next job, so finishing")
-                break
-            if successorJobNode.disk > jobGraph.disk:
-                logger.debug("We need more disk for the next job, so finishing")
-                break
-            if successorJobNode.preemptable != jobGraph.preemptable:
-                logger.debug("Preemptability is different for the next job, returning to the leader")
-                break
-            if successorJobNode.predecessorNumber > 1:
-                logger.debug("The jobGraph has multiple predecessors, we must return to the leader.")
-                break
-
-            # Load the successor jobGraph
-            successorJobGraph = jobStore.load(successorJobNode.jobStoreID)
-
-            # add the successor to the list of jobs run
-            listOfJobs.append(str(successorJobGraph))
-
-            # Somewhat ugly, but check if job is a checkpoint job and quit if
-            # so
-            if successorJobGraph.command.startswith( "_toil " ):
-                #Load the job
-                successorJob = Job._loadJob(successorJobGraph.command, jobStore)
-
-                # Check it is not a checkpoint
-                if successorJob.checkpoint:
-                    logger.debug("Next job is checkpoint, so finishing")
-                    break
 
             ##########################################
             #We have a single successor job that is not a checkpoint job.
@@ -415,20 +341,15 @@ def main():
             #We can then delete the successor jobGraph in the jobStore, as it is
             #wholly incorporated into the current jobGraph.
             ##########################################
-            
+
+            # add the successor to the list of jobs run
+            listOfJobs.append(str(successorJobGraph))
+
             #Clone the jobGraph and its stack
             jobGraph = copy.deepcopy(jobGraph)
             
             #Remove the successor jobGraph
             jobGraph.stack.pop()
-
-            #These should all match up
-            assert successorJobGraph.memory == successorJobNode.memory
-            assert successorJobGraph.cores == successorJobNode.cores
-            assert successorJobGraph.predecessorsFinished == set()
-            assert successorJobGraph.predecessorNumber == 1
-            assert successorJobGraph.command is not None
-            assert successorJobGraph.jobStoreID == successorJobNode.jobStoreID
 
             #Transplant the command and stack to the current jobGraph
             jobGraph.command = successorJobGraph.command
@@ -469,7 +390,9 @@ def main():
             statsDict.workers.memory = str(totalMemoryUsage)
 
         # log the worker log path here so that if the file is truncated the path can still be found
-        logger.info("Worker log can be found at %s. Set --cleanWorkDir to retain this log", localWorkerTempDir)
+        if redirectOutputToLogFile:
+            logger.info("Worker log can be found at %s. Set --cleanWorkDir to retain this log", localWorkerTempDir)
+        
         logger.info("Finished running the chain of jobs on this node, we ran for a total of %f seconds", time.time() - startTime)
     
     ##########################################
@@ -499,30 +422,32 @@ def main():
     ##########################################
     #Cleanup
     ##########################################
-    
-    #Close the worker logging
-    #Flush at the Python level
+
+    # Close the worker logging
+    # Flush at the Python level
     sys.stdout.flush()
     sys.stderr.flush()
-    #Flush at the OS level
-    os.fsync(1)
-    os.fsync(2)
+    if redirectOutputToLogFile:
+        # Flush at the OS level
+        os.fsync(1)
+        os.fsync(2)
 
-    #Close redirected stdout and replace with the original standard output.
-    os.dup2(origStdOut, 1)
+        # Close redirected stdout and replace with the original standard output.
+        os.dup2(origStdOut, 1)
 
-    #Close redirected stderr and replace with the original standard error.
-    os.dup2(origStdErr, 2)
+        # Close redirected stderr and replace with the original standard error.
+        os.dup2(origStdErr, 2)
 
-    #sys.stdout and sys.stderr don't need to be modified at all. We don't need
-    #to call redirectLoggerStreamHandlers since they still log to sys.stderr
+        # sys.stdout and sys.stderr don't need to be modified at all. We don't
+        # need to call redirectLoggerStreamHandlers since they still log to
+        # sys.stderr
 
-    #Close our extra handles to the original standard output and standard error
-    #streams, so we don't leak file handles.
-    os.close(origStdOut)
-    os.close(origStdErr)
+        # Close our extra handles to the original standard output and standard
+        # error streams, so we don't leak file handles.
+        os.close(origStdOut)
+        os.close(origStdErr)
 
-    #Now our file handles are in exactly the state they were in before.
+    # Now our file handles are in exactly the state they were in before.
 
     #Copy back the log file to the global dir, if needed
     if workerFailed:
@@ -538,7 +463,7 @@ def main():
                 w.write(f.read())
         jobStore.update(jobGraph)
 
-    elif debugging:  # write log messages
+    elif debugging and redirectOutputToLogFile:  # write log messages
         with open(tempWorkerLogPath, 'r') as logFile:
             if os.path.getsize(tempWorkerLogPath) > logFileByteReportLimit != 0:
                 if logFileByteReportLimit > 0:
@@ -561,3 +486,32 @@ def main():
     if (not workerFailed) and jobGraph.command == None and len(jobGraph.stack) == 0 and len(jobGraph.services) == 0:
         # We can now safely get rid of the jobGraph
         jobStore.delete(jobGraph.jobStoreID)
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+
+    # Parse input args
+    jobName = argv[1]
+    jobStoreLocator = argv[2]
+    jobStoreID = argv[3]
+
+    ##########################################
+    #Load the jobStore/config file
+    ##########################################
+
+    # Try to monkey-patch boto early so that credentials are cached.
+    try:
+        import boto
+    except ImportError:
+        pass
+    else:
+        # boto is installed, monkey patch it now
+        from bd2k.util.ec2.credentials import enable_metadata_credential_caching
+        enable_metadata_credential_caching()
+
+    jobStore = Toil.resumeJobStore(jobStoreLocator)
+    config = jobStore.config
+
+    # Call the worker
+    workerScript(jobStore, config, jobName, jobStoreID)

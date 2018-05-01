@@ -14,6 +14,8 @@
 
 from __future__ import absolute_import
 
+from builtins import range
+from builtins import object
 import socket
 import sys
 import os
@@ -26,7 +28,7 @@ import math
 import shutil
 from argparse import ArgumentParser
 from optparse import OptionContainer, OptionGroup
-import subprocess
+from toil import subprocess
 
 # Python 3 compatibility imports
 from six.moves import xrange
@@ -124,12 +126,15 @@ def _addLoggingOptions(addOptionFn):
     # BEFORE YOU ADD OR REMOVE OPTIONS TO THIS FUNCTION, KNOW THAT YOU MAY ONLY USE VARIABLES ACCEPTED BY BOTH
     # optparse AND argparse FOR EXAMPLE, YOU MAY NOT USE default=%default OR default=%(default)s
     defaultLogLevelName = logging.getLevelName( defaultLogLevel )
-    addOptionFn("--logOff", dest="logCritical", action="store_true", default=False,
+    addOptionFn("--logOff", dest="logLevel",
+                default=defaultLogLevelName,
+                action="store_const", const="CRITICAL",
                 help="Same as --logCritical")
     for level in supportedLogLevels:
         levelName = logging.getLevelName(level)
         levelNameCapitalized = levelName.capitalize()
         addOptionFn("--log" + levelNameCapitalized, dest="logLevel",
+                    default=defaultLogLevelName,
                     action="store_const", const=levelName,
                     help="Turn on logging at level %s and above. (default is %s)" % (levelName, defaultLogLevelName))
     addOptionFn("--logLevel", dest="logLevel", default=defaultLogLevelName,
@@ -205,7 +210,7 @@ def absSymPath(path):
 #########################################################
 #########################################################
 
-class TestStatus:
+class TestStatus(object):
     ###Global variables used by testing framework to run tests.
     TEST_SHORT = 0
     TEST_MEDIUM = 1
@@ -287,7 +292,7 @@ def parseBasicOptions(parser):
 def getRandomAlphaNumericString(length=10):
     """Returns a random alpha numeric string of the given length.
     """
-    return "".join([ random.choice('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz') for i in xrange(0, length) ])
+    return "".join([ random.choice('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz') for i in range(0, length) ])
 
 def makePublicDir(dirName):
     """Makes a given subdirectory if it doesn't already exist, making sure it is public.

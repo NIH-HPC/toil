@@ -14,6 +14,8 @@
 
 from __future__ import absolute_import
 
+from builtins import str
+from builtins import object
 import gzip
 import json
 import logging
@@ -25,6 +27,7 @@ from bd2k.util.expando import Expando
 from toil.lib.bioio import getTotalCpuTime
 
 logger = logging.getLogger( __name__ )
+
 
 class StatsAndLogging( object ):
     """
@@ -41,6 +44,13 @@ class StatsAndLogging( object ):
         Start the stats and logging thread.
         """
         self._worker.start()
+
+    @classmethod
+    def logWithFormatting(cls, jobStoreID, jobLogs, method=logger.debug, message=None):
+        if message is not None:
+            method(message)
+        for line in jobLogs:
+            method('%s    %s', jobStoreID, line.rstrip('\n'))
 
     @classmethod
     def writeLogFiles(cls, jobNames, jobLogList, config):
@@ -111,14 +121,11 @@ class StatsAndLogging( object ):
             except AttributeError:
                 pass
             else:
-                def logWithFormatting(jobStoreID, jobLogs):
-                    logFormat = '\n%s    ' % jobStoreID
-                    logger.debug('Received Toil worker log. Disable debug level '
-                                 'logging to hide this output\n%s', logFormat.join(jobLogs))
                 # we may have multiple jobs per worker
                 jobNames = logs.names
                 messages = logs.messages
-                logWithFormatting(jobNames[0], messages)
+                cls.logWithFormatting(jobNames[0], messages,
+                                      message='Received Toil worker log. Disable debug level logging to hide this output')
                 cls.writeLogFiles(jobNames, messages, config=config)
 
         while True:

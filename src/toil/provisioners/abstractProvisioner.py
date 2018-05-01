@@ -1,4 +1,4 @@
-# Copyright (C) 2015-2016 Regents of the University of California
+# Copyright (C) 2015-2018 Regents of the University of California
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,29 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
-import logging
-import os
 from abc import ABCMeta, abstractmethod
-
+from builtins import object
 from collections import namedtuple
+import logging
+import os.path
+from toil import subprocess
+from toil import applianceSelf
 
-from itertools import islice
 
-import time
+from future.utils import with_metaclass
 
-from bd2k.util.retry import retry, never
-from bd2k.util.threading import ExceptionalThread
-
-from toil.batchSystems.abstractBatchSystem import AbstractScalableBatchSystem
+from bd2k.util.retry import never
+a_short_time = 5
 
 log = logging.getLogger(__name__)
 
 
-Shape = namedtuple("_Shape", "wallTime memory cores disk")
+Shape = namedtuple("_Shape", "wallTime memory cores disk preemptable")
 """
 Represents a job or a node's "shape", in terms of the dimensions of memory, cores, disk and
-wall-time allocation. All attributes are integers.
+wall-time allocation.
 
 The wallTime attribute stores the number of seconds of a node allocation, e.g. 3600 for AWS,
 or 60 for Azure. FIXME: and for jobs?
@@ -43,237 +41,316 @@ node) in RAM or on disk (SSD or HDD), respectively.
 """
 
 
-class AbstractProvisioner(object):
+class AbstractProvisioner(with_metaclass(ABCMeta, object)):
     """
     An abstract base class to represent the interface for provisioning worker nodes to use in a
     Toil cluster.
     """
 
-    __metaclass__ = ABCMeta
+    LEADER_HOME_DIR = '/root/' # home directory in the Toil appliance on an instance
 
-    def __init__(self, config, batchSystem):
-        self.config = config
-        self.batchSystem = batchSystem
-        self.stop = False
-        self.stats = {}
-        self.statsThreads = []
-        self.statsPath = config.clusterStats
-        self.scaleable = isinstance(self.batchSystem, AbstractScalableBatchSystem)
+    def __init__(self, clusterName=None, zone=None, nodeStorage=50):
+        """
+        Initialize provisioner.
+
+        :param clusterName: The cluster identifier.
+        :param zone: The zone the cluster runs in.
+        :param nodeStorage: The amount of storage on the worker instances, in gigabytes.
+        """
+        self.clusterName = clusterName
+        self._zone = zone
+        self._nodeStorage = nodeStorage
+        self._leaderPrivateIP = None
+
+    def readClusterSettings(self):
+        """
+        Initialize class from an existing cluster. This method assumes that
+        the instance we are running on is the leader.
+        """
+        raise NotImplementedError
+
+    def setAutoscaledNodeTypes(self, nodeTypes):
+        """
+        Set node types, shapes and spot bids. Preemptable nodes will have the form "type:spotBid".
+        :param nodeTypes: A list of node types
+        """
+        spotBids = []
+        nonPreemptableNodeTypes = []
+        preemptableNodeTypes = []
+        for nodeTypeStr in nodeTypes:
+            nodeBidTuple = nodeTypeStr.split(":")
+            if len(nodeBidTuple) == 2:
+                #This is a preemptable node type, with a spot bid
+                preemptableNodeTypes.append(nodeBidTuple[0])
+                spotBids.append(nodeBidTuple[1])
+            else:
+                nonPreemptableNodeTypes.append(nodeTypeStr)
+        preemptableNodeShapes = [self.getNodeShape(nodeType=nodeType, preemptable=True)
+                                      for nodeType in preemptableNodeTypes]
+        nonPreemptableNodeShapes = [self.getNodeShape(nodeType=nodeType, preemptable=False)
+                                         for nodeType in nonPreemptableNodeTypes]
+        self.nodeShapes = nonPreemptableNodeShapes + preemptableNodeShapes
+        self.nodeTypes = nonPreemptableNodeTypes + preemptableNodeTypes
+        self._spotBidsMap = dict(zip(preemptableNodeTypes, spotBids))
 
     @staticmethod
     def retryPredicate(e):
         """
-        Return true if the exception e should be retried by the cluster scaler
+        Return true if the exception e should be retried by the cluster scaler.
+        For example, should return true if the exception was due to exceeding an API rate limit.
+        The error will be retried with exponential backoff.
 
         :param e: exception raised during execution of setNodeCount
         :return: boolean indicating whether the exception e should be retried
         """
         return never(e)
 
-    def shutDown(self, preemptable):
-        if not self.stop:
-            # only shutdown the stats threads once
-            self._shutDownStats()
-        log.debug('Forcing provisioner to reduce cluster size to zero.')
-        totalNodes = self.setNodeCount(numNodes=0, preemptable=preemptable, force=True)
-        if totalNodes != 0:
-            raise RuntimeError('Provisioner was not able to reduce cluster size to zero.')
-
-    def _shutDownStats(self):
-        def getFileName():
-            extension = '.json'
-            file = '%s-stats' % self.config.jobStore
-            counter = 0
-            while True:
-                suffix = str(counter).zfill(3) + extension
-                fullName = os.path.join(self.statsPath, file + suffix)
-                if not os.path.exists(fullName):
-                    return fullName
-                counter += 1
-        if self.config.clusterStats and self.scaleable:
-            self.stop = True
-            for thread in self.statsThreads:
-                thread.join()
-            fileName = getFileName()
-            with open(fileName, 'w') as f:
-                json.dump(self.stats, f)
-
-    def startStats(self, preemptable):
-        thread = ExceptionalThread(target=self._gatherStats, args=[preemptable])
-        thread.start()
-        self.statsThreads.append(thread)
-
-    def checkStats(self):
-        for thread in self.statsThreads:
-            # propagate any errors raised in the threads execution
-            thread.join(timeout=0)
-
-    def _gatherStats(self, preemptable):
-        def toDict(nodeInfo):
-            # convert NodeInfo object to dict to improve JSON output
-            return dict(memory=nodeInfo.memoryUsed,
-                        cores=nodeInfo.coresUsed,
-                        memoryTotal=nodeInfo.memoryTotal,
-                        coresTotal=nodeInfo.coresTotal,
-                        requestedCores=nodeInfo.requestedCores,
-                        requestedMemory=nodeInfo.requestedMemory,
-                        workers=nodeInfo.workers,
-                        time=time.time()  # add time stamp
-                        )
-        if self.scaleable:
-            stats = {}
-            try:
-                while not self.stop:
-                    nodeInfo = self.batchSystem.getNodes(preemptable)
-                    for nodeIP in nodeInfo.keys():
-                        nodeStats = nodeInfo[nodeIP]
-                        if nodeStats is not None:
-                            nodeStats = toDict(nodeStats)
-                            try:
-                                # if the node is already registered update the dictionary with
-                                # the newly reported stats
-                                stats[nodeIP].append(nodeStats)
-                            except KeyError:
-                                # create a new entry for the node
-                                stats[nodeIP] = [nodeStats]
-                    time.sleep(60)
-            finally:
-                threadName = 'Preemptable' if preemptable else 'Non-preemptable'
-                log.debug('%s provisioner stats thread shut down successfully.', threadName)
-                self.stats[threadName] = stats
-        else:
-            pass
-
-    def setNodeCount(self, numNodes, preemptable=False, force=False):
+    @abstractmethod
+    def launchCluster(self, leaderNodeType, leaderStorage, owner, **kwargs):
         """
-        Attempt to grow or shrink the number of prepemptable or non-preemptable worker nodes in
-        the cluster to the given value, or as close a value as possible, and, after performing
-        the necessary additions or removals of worker nodes, return the resulting number of
-        preemptable or non-preemptable nodes currently in the cluster.
+        Initialize a cluster and create a leader node.
 
-        :param int numNodes: Desired size of the cluster
+        :param leaderNodeType: The leader instance.
+        :param leaderStorage: The amount of disk to allocate to the leader in gigabytes.
+        :param owner: Tag identifying the owner of the instances.
 
-        :param bool preemptable: whether the added nodes will be preemptable, i.e. whether they
-               may be removed spontaneously by the underlying platform at any time.
-
-        :param bool force: If False, the provisioner is allowed to deviate from the given number
-               of nodes. For example, when downsizing a cluster, a provisioner might leave nodes
-               running if they have active jobs running on them.
-
-        :rtype: int :return: the number of nodes in the cluster after making the necessary
-                adjustments. This value should be, but is not guaranteed to be, close or equal to
-                the `numNodes` argument. It represents the closest possible approximation of the
-                actual cluster size at the time this method returns.
         """
-        for attempt in retry(predicate=self.retryPredicate):
-            with attempt:
-                workerInstances = self._getWorkersInCluster(preemptable)
-                numCurrentNodes = len(workerInstances)
-                delta = numNodes - numCurrentNodes
-                if delta > 0:
-                    log.info('Adding %i %s nodes to get to desired cluster size of %i.', delta, 'preemptable' if preemptable else 'non-preemptable', numNodes)
-                    numNodes = numCurrentNodes + self._addNodes(workerInstances,
-                                                                numNodes=delta,
-                                                                preemptable=preemptable)
-                elif delta < 0:
-                    log.info('Removing %i %s nodes to get to desired cluster size of %i.', -delta, 'preemptable' if preemptable else 'non-preemptable', numNodes)
-                    numNodes = numCurrentNodes - self._removeNodes(workerInstances,
-                                                                   numNodes=-delta,
-                                                                   preemptable=preemptable,
-                                                                   force=force)
-                else:
-                    log.info('Cluster already at desired size of %i. Nothing to do.', numNodes)
-        return numNodes
-
-    def _removeNodes(self, instances, numNodes, preemptable=False, force=False):
-        # If the batch system is scalable, we can use the number of currently running workers on
-        # each node as the primary criterion to select which nodes to terminate.
-        if isinstance(self.batchSystem, AbstractScalableBatchSystem):
-            nodes = self.batchSystem.getNodes(preemptable)
-            # Join nodes and instances on private IP address.
-            nodes = [(instance, nodes.get(instance.private_ip_address)) for instance in instances]
-            log.debug('Nodes considered to terminate: %s', ' '.join(map(str, nodes)))
-            # Unless forced, exclude nodes with runnning workers. Note that it is possible for
-            # the batch system to report stale nodes for which the corresponding instance was
-            # terminated already. There can also be instances that the batch system doesn't have
-            # nodes for yet. We'll ignore those, too, unless forced.
-            nodesToTerminate = []
-            for instance, nodeInfo in nodes:
-                if force:
-                    nodesToTerminate.append((instance, nodeInfo))
-                elif nodeInfo is not None and nodeInfo.workers < 1:
-                    nodesToTerminate.append((instance, nodeInfo))
-                else:
-                    log.debug('Not terminating instances %s. Node info: %s', instance, nodeInfo)
-            # Sort nodes by number of workers and time left in billing cycle
-            nodesToTerminate.sort(key=lambda (instance, nodeInfo): (
-                nodeInfo.workers if nodeInfo else 1,
-                self._remainingBillingInterval(instance)))
-            if not force:
-                # don't terminate nodes that still have > 15% left in their allocated (prepaid) time
-                nodesToTerminate = [nodeTuple for nodeTuple in nodesToTerminate if self._remainingBillingInterval(nodeTuple[0]) <= 0.15]
-            nodesToTerminate = nodesToTerminate[:numNodes]
-            if log.isEnabledFor(logging.DEBUG):
-                for instance, nodeInfo in nodesToTerminate:
-                    log.debug("Instance %s is about to be terminated. Its node info is %r. It "
-                              "would be billed again in %s minutes.", instance.id, nodeInfo,
-                              60 * self._remainingBillingInterval(instance))
-            instances = [instance for instance, nodeInfo in nodesToTerminate]
-        else:
-            # Without load info all we can do is sort instances by time left in billing cycle.
-            instances = sorted(instances, key=self._remainingBillingInterval)
-            instances = [instance for instance in islice(instances, numNodes)]
-        log.info('Terminating %i instance(s).', len(instances))
-        if instances:
-            self._logAndTerminate(instances)
-        return len(instances)
-
-    @abstractmethod
-    def _addNodes(self, instances, numNodes, preemptable):
         raise NotImplementedError
 
     @abstractmethod
-    def _logAndTerminate(self, instances):
+    def addNodes(self, nodeType, numNodes, preemptable, spotBid=None):
+        """
+        Used to add worker nodes to the cluster
+
+        :param numNodes: The number of nodes to add
+        :param preemptable: whether or not the nodes will be preemptable
+        :param spotBid: The bid for preemptable nodes if applicable (this can be set in config, also).
+        :return: number of nodes successfully added
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def _getWorkersInCluster(self, preemptable):
+    def terminateNodes(self, nodes):
+        """
+        Terminate the nodes represented by given Node objects
+
+        :param nodes: list of Node objects
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def _remainingBillingInterval(self, instance):
+    def getLeader(self):
+        """
+        :return: The leader node.
+        """
         raise NotImplementedError
 
     @abstractmethod
-    def getNodeShape(self, preemptable=False):
+    def getProvisionedWorkers(self, nodeType, preemptable):
+        """
+        Gets all nodes of the given preemptability from the provisioner.
+        Includes both static and autoscaled nodes.
+
+        :param preemptable: Boolean value indicating whether to return preemptable nodes or
+           non-preemptable nodes
+        :return: list of Node objects
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def getNodeShape(self, nodeType=None, preemptable=False):
         """
         The shape of a preemptable or non-preemptable node managed by this provisioner. The node
         shape defines key properties of a machine, such as its number of cores or the time
         between billing intervals.
 
-        :param preemptable: Whether to return the shape of preemptable nodes or that of
-               non-preemptable ones.
+        :param str nodeType: Node type name to return the shape of.
 
         :rtype: Shape
         """
         raise NotImplementedError
 
-    @classmethod
     @abstractmethod
-    def rsyncLeader(cls, clusterName, src, dst):
+    def destroyCluster(self):
+        """
+        Terminates all nodes in the specified cluster and cleans up all resources associated with the
+        cluser.
+        :param clusterName: identifier of the cluster to terminate.
+        """
         raise NotImplementedError
 
-    @classmethod
-    @abstractmethod
-    def launchCluster(cls, instanceType, keyName, clusterName, spotBid=None):
-        raise NotImplementedError
+    def _setSSH(self):
+        """
+        Generate a key pair, save it in /root/.ssh/id_rsa.pub, and return the public key.
+        The file /root/.sshSuccess is used to prevent this operation from running twice.
+        :return Public key.
+        """
+        if not os.path.exists('/root/.sshSuccess'):
+            subprocess.check_call(['ssh-keygen', '-f', '/root/.ssh/id_rsa', '-t', 'rsa', '-N', ''])
+            with open('/root/.sshSuccess', 'w') as f:
+                f.write('written here because of restrictive permissions on .ssh dir')
+        os.chmod('/root/.ssh', 0o700)
+        subprocess.check_call(['bash', '-c', 'eval $(ssh-agent) && ssh-add -k'])
+        with open('/root/.ssh/id_rsa.pub') as f:
+            masterPublicKey = f.read()
+        masterPublicKey = masterPublicKey.split(' ')[1]  # take 'body' of key
+        # confirm it really is an RSA public key
+        assert masterPublicKey.startswith('AAAAB3NzaC1yc2E'), masterPublicKey
+        return masterPublicKey
 
-    @classmethod
-    @abstractmethod
-    def sshLeader(cls, clusterName, args):
-        raise NotImplementedError
 
-    @classmethod
-    @abstractmethod
-    def destroyCluster(cls, clusterName):
-        raise NotImplementedError
+
+
+
+
+
+    cloudConfigTemplate = """#cloud-config
+
+write_files:
+    - path: "/home/core/volumes.sh"
+      permissions: "0777"
+      owner: "root"
+      content: |
+        #!/bin/bash
+        set -x
+        ephemeral_count=0
+        drives=""
+        directories="toil mesos docker"
+        for drive in /dev/xvd{{b..z}} /dev/nvme*n*; do
+            echo checking for $drive
+            if [ -b $drive ]; then
+                echo found it
+                ephemeral_count=$((ephemeral_count + 1 ))
+                drives="$drives $drive"
+                echo increased ephemeral count by one
+            fi
+        done
+        if (("$ephemeral_count" == "0" )); then
+            echo no ephemeral drive
+            for directory in $directories; do
+                sudo mkdir -p /var/lib/$directory
+            done
+            exit 0
+        fi
+        sudo mkdir /mnt/ephemeral
+        if (("$ephemeral_count" == "1" )); then
+            echo one ephemeral drive to mount
+            sudo mkfs.ext4 -F $drives
+            sudo mount $drives /mnt/ephemeral
+        fi
+        if (("$ephemeral_count" > "1" )); then
+            echo multiple drives
+            for drive in $drives; do
+                dd if=/dev/zero of=$drive bs=4096 count=1024
+            done
+            sudo mdadm --create -f --verbose /dev/md0 --level=0 --raid-devices=$ephemeral_count $drives # determine force flag
+            sudo mkfs.ext4 -F /dev/md0
+            sudo mount /dev/md0 /mnt/ephemeral
+        fi
+        for directory in $directories; do
+            sudo mkdir -p /mnt/ephemeral/var/lib/$directory
+            sudo mkdir -p /var/lib/$directory
+            sudo mount --bind /mnt/ephemeral/var/lib/$directory /var/lib/$directory
+        done
+
+coreos:
+    update:
+      reboot-strategy: off
+    units:
+    - name: "volume-mounting.service"
+      command: "start"
+      content: |
+        [Unit]
+        Description=mounts ephemeral volumes & bind mounts toil directories
+        Before=docker.service
+
+        [Service]
+        Type=oneshot
+        Restart=no
+        ExecStart=/usr/bin/bash /home/core/volumes.sh
+
+    - name: "toil-{role}.service"
+      command: "start"
+      content: |
+        [Unit]
+        Description=toil-{role} container
+        After=docker.service
+
+        [Service]
+        Restart=on-failure
+        RestartSec=2
+        ExecStartPre=-/usr/bin/docker rm toil_{role}
+        ExecStart=/usr/bin/docker run \
+            --entrypoint={entrypoint} \
+            --net=host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /var/lib/mesos:/var/lib/mesos \
+            -v /var/lib/docker:/var/lib/docker \
+            -v /var/lib/toil:/var/lib/toil \
+            -v /var/lib/cwl:/var/lib/cwl \
+            -v /tmp:/tmp \
+            --name=toil_{role} \
+            {dockerImage} \
+            {mesosArgs}
+    - name: "node-exporter.service"
+      command: "start"
+      content: |
+        [Unit]
+        Description=node-exporter container
+        After=docker.service
+
+        [Service]
+        Restart=on-failure
+        RestartSec=2
+        ExecStartPre=-/usr/bin/docker rm node_exporter
+        ExecStart=/usr/bin/docker run \
+            -p 9100:9100 \
+            -v /proc:/host/proc \
+            -v /sys:/host/sys \
+            -v /:/rootfs \
+            --name node-exporter \
+            --restart always \
+            prom/node-exporter:v0.15.2 \
+            --path.procfs /host/proc \
+            --path.sysfs /host/sys \
+            --collector.filesystem.ignored-mount-points ^/(sys|proc|dev|host|etc)($|/)
+"""
+
+    sshTemplate = """ssh_authorized_keys:
+    - "ssh-rsa {sshKey}"
+"""
+
+
+       # If keys are rsynced, then the mesos-slave needs to be started after the keys have been
+        # transferred. The waitForKey.sh script loops on the new VM until it finds the keyPath file, then it starts the
+        # mesos-slave. If there are multiple keys to be transferred, then the last one to be transferred must be
+        # set to keyPath.
+
+    MESOS_LOG_DIR = '--log_dir=/var/lib/mesos '
+    LEADER_DOCKER_ARGS = '--registry=in_memory --cluster={name}'
+    WORKER_DOCKER_ARGS = '--work_dir=/var/lib/mesos --master={ip}:5050 --attributes=preemptable:{preemptable}'
+    def _getCloudConfigUserData(self, role, masterPublicKey=None, keyPath=None, preemptable=False):
+        if role == 'leader':
+            entryPoint = 'mesos-master'
+            mesosArgs = self.MESOS_LOG_DIR + self.LEADER_DOCKER_ARGS.format(name=self.clusterName)
+        elif role == 'worker':
+            entryPoint = 'mesos-slave'
+            mesosArgs = self.MESOS_LOG_DIR + self.WORKER_DOCKER_ARGS.format(ip=self._leaderPrivateIP,
+                                                        preemptable=preemptable)
+        else:
+            raise RuntimeError("Unknown role %s" % role)
+
+        template = self.cloudConfigTemplate
+        if masterPublicKey:
+            template += self.sshTemplate
+        if keyPath:
+            mesosArgs = keyPath + ' ' + mesosArgs
+            entryPoint = "waitForKey.sh"
+        templateArgs = dict(role=role,
+                            dockerImage=applianceSelf(),
+                            entrypoint=entryPoint,
+                            sshKey=masterPublicKey,   # ignored if None
+                            mesosArgs=mesosArgs)
+        userData = template.format(**templateArgs)
+        return userData
+

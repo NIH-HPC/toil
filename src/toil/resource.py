@@ -14,6 +14,9 @@
 
 from __future__ import absolute_import
 
+from future import standard_library
+standard_library.install_aliases()
+from builtins import map
 import errno
 import hashlib
 import importlib
@@ -27,8 +30,8 @@ from contextlib import closing
 from io import BytesIO
 from pydoc import locate
 from tempfile import mkdtemp
-from urllib2 import HTTPError
-from zipfile import ZipFile, PyZipFile
+from urllib.error import HTTPError
+from zipfile import ZipFile
 
 # Python 3 compatibility imports
 from bd2k.util.retry import retry
@@ -36,7 +39,6 @@ from six.moves.urllib.request import urlopen
 
 from bd2k.util import strict_bool
 from bd2k.util.iterables import concat
-from bd2k.util.exceptions import require
 
 from toil import inVirtualEnv
 
@@ -122,7 +124,7 @@ class Resource(namedtuple('Resource', ('name', 'pathHash', 'url', 'contentHash')
         resourceRootDirPath = os.environ[cls.rootDirPathEnvName]
         os.environ.pop(cls.rootDirPathEnvName)
         shutil.rmtree(resourceRootDirPath)
-        for k, v in os.environ.items():
+        for k, v in list(os.environ.items()):
             if k.startswith(cls.resourceEnvNamePrefix):
                 os.environ.pop(k)
 
@@ -145,9 +147,10 @@ class Resource(namedtuple('Resource', ('name', 'pathHash', 'url', 'contentHash')
         """
         pathHash = cls._pathHash(leaderPath)
         try:
-            s = os.environ[cls.resourceEnvNamePrefix + pathHash]
+            path_key = cls.resourceEnvNamePrefix + pathHash
+            s = os.environ[path_key]
         except KeyError:
-            log.warn("Can't find resource for leader path '%s'", leaderPath)
+            log.warn("'%s' may exist, but is not yet referenced by the worker (KeyError from os.environ[]).", str(path_key))
             return None
         else:
             self = cls.unpickle(s)
@@ -265,8 +268,8 @@ class FileResource(Resource):
 class DirectoryResource(Resource):
     """
     A resource read from a directory on the leader. The URL will point to a ZIP archive of the
-    directory. Only Python script/modules will be included. The directory may be a package but it
-    does not need to be.
+    directory. All files in that directory (and any subdirectories) will be included. The directory
+    may be a package but it does not need to be.
     """
 
     @classmethod
@@ -275,10 +278,20 @@ class DirectoryResource(Resource):
         :type path: str
         """
         bytesIO = BytesIO()
-        # PyZipFile compiles .py files on the fly, filters out any non-Python files and
-        # distinguishes between packages and simple directories.
-        with PyZipFile(file=bytesIO, mode='w') as zipFile:
-            zipFile.writepy(path)
+        initfile = os.path.join(path, '__init__.py')
+        if os.path.isfile(initfile):
+            # This is a package directory. To emulate
+            # PyZipFile.writepy's behavior, we need to keep everything
+            # relative to this path's parent directory.
+            rootDir = os.path.dirname(path)
+        else:
+            # This is a simple user script (with possibly a few helper files)
+            rootDir = path
+        with ZipFile(file=bytesIO, mode='w') as zipFile:
+            for dirName, _, fileList in os.walk(path):
+                for fileName in fileList:
+                    fullPath = os.path.join(dirName, fileName)
+                    zipFile.write(fullPath, os.path.relpath(fullPath, rootDir))
         bytesIO.seek(0)
         return bytesIO
 
@@ -297,23 +310,21 @@ class DirectoryResource(Resource):
 class VirtualEnvResource(DirectoryResource):
     """
     A resource read from a virtualenv on the leader. All modules and packages found in the
-    virtualenv's site-packages directory will be included. Any .pth or .egg-link files will be
-    ignored.
+    virtualenv's site-packages directory will be included.
     """
-
     @classmethod
     def _load(cls, path):
-        sitePackages = path
-        assert os.path.basename(sitePackages) == 'site-packages'
+        """
+        :type path: str
+        """
+        assert os.path.basename(path) == 'site-packages'
         bytesIO = BytesIO()
-        with PyZipFile(file=bytesIO, mode='w') as zipFile:
-            # This adds the .py files but omits subdirectories since site-packages is not a package
-            zipFile.writepy(sitePackages)
-            # Now add the missing packages
-            for name in os.listdir(sitePackages):
-                path = os.path.join(sitePackages, name)
-                if os.path.isdir(path) and os.path.isfile(os.path.join(path, '__init__.py')):
-                    zipFile.writepy(path)
+        with ZipFile(file=bytesIO, mode='w') as zipFile:
+            for dirName, _, fileList in os.walk(path):
+                zipFile.write(dirName)
+                for fileName in fileList:
+                    fullPath = os.path.join(dirName, fileName)
+                    zipFile.write(fullPath, os.path.relpath(fullPath, path))
         bytesIO.seek(0)
         return bytesIO
 
@@ -370,9 +381,8 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
         filePath = os.path.abspath(module.__file__)
         filePath = filePath.split(os.path.sep)
         filePath[-1], extension = os.path.splitext(filePath[-1])
-        require(extension in ('.py', '.pyc'),
-                'The name of a user script/module must end in .py or .pyc.')
-        log.debug("Module name is %s", name)
+        if not extension in ('.py', '.pyc'):
+            raise Exception('The name of a user script/module must end in .py or .pyc.')
         if name == '__main__':
             log.debug("Discovering real name of module")
             # User script/module was invoked as the main program
@@ -393,14 +403,17 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
                 cls._check_conflict(dirPath, name)
         else:
             # User module was imported. Determine the directory containing the top-level package
+            if filePath[-1] == '__init__':
+                # module is a subpackage
+                filePath.pop()
+
             for package in reversed(name.split('.')):
                 dirPathTail = filePath.pop()
                 assert dirPathTail == package
             dirPath = os.path.sep.join(filePath)
         log.debug("Module dir is %s", dirPath)
-        require(os.path.isdir(dirPath),
-                'Bad directory path %s for module %s. Note that hot-deployment does not support \
-                .egg-link files yet, or scripts located in the root directory.', dirPath, name)
+        if not os.path.isdir(dirPath):
+            raise Exception('Bad directory path %s for module %s. Note that hot-deployment does not support .egg-link files yet, or scripts located in the root directory.' % (dirPath, name))
         fromVirtualEnv = inVirtualEnv() and dirPath.startswith(sys.prefix)
         return cls(dirPath=dirPath, name=name, fromVirtualEnv=fromVirtualEnv)
 
@@ -446,7 +459,7 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
 
     def _getResourceClass(self):
         """
-        Return the concrete subclass of Resource that's appropriate for hot-deploying this module.
+        Return the concrete subclass of Resource that's appropriate for auto-deploying this module.
         """
         if self.fromVirtualEnv:
             subcls = VirtualEnvResource
@@ -472,7 +485,6 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
             log.warn('The localize() method should only be invoked on a worker.')
         resource = Resource.lookup(self._resourcePath)
         if resource is None:
-            log.warn("Can't localize module %r", self)
             return self
         else:
             def stash(tmpDirPath):
@@ -493,7 +505,15 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
             log.warning('Cannot determine main program module.')
             return False
         else:
-            mainModuleFile = os.path.basename(mainModule.__file__)
+            # If __file__ is not a valid attribute, it's because
+            # toil is being run interactively, in which case
+            # we can reasonably assume that we are not running
+            # on a worker node.
+            try:
+                mainModuleFile = os.path.basename(mainModule.__file__)
+            except AttributeError:
+                return False
+
             workerModuleFiles = concat(('worker' + ext for ext in self.moduleExtensions),
                                        '_toil_worker')  # the setuptools entry point
             return mainModuleFile in workerModuleFiles

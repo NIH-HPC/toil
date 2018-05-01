@@ -13,14 +13,18 @@
 # limitations under the License.
 
 from __future__ import absolute_import, print_function
+from builtins import str
+from builtins import range
 import unittest
 import os
 import random
+from contextlib import contextmanager
 from uuid import uuid4
 import logging
-import subprocess
+from toil import subprocess
 
 # Python 3 compatibility imports
+import errno
 from six.moves import xrange
 
 from toil import resolveEntryPoint
@@ -30,7 +34,7 @@ from toil.common import Toil
 from toil.job import Job, JobException
 from toil.lib.bioio import getLogLevelString
 from toil.batchSystems.mesos.test import MesosTestSupport
-from toil.test.sort.sort import setup, sortMemory, merge, sort, copySubRangeOfFile, getMidPoint
+from toil.test.sort.sort import merge, sort, copySubRangeOfFile, getMidPoint, makeFileToSort, main
 from toil.test import (ToilTest,
                        needs_aws,
                        needs_mesos,
@@ -39,7 +43,7 @@ from toil.test import (ToilTest,
                        needs_gridengine,
                        needs_torque,
                        needs_google,
-                       experimental)
+                       slow)
 from toil.jobStores.abstractJobStore import NoSuchJobStoreException, JobStoreExistsException
 from toil.leader import FailedJobsException
 
@@ -50,6 +54,23 @@ defaultLines = int(os.environ.get('TOIL_TEST_SORT_LINES', '10'))
 defaultN = int(os.environ.get('TOIL_TEST_SORT_N', str(defaultLineLen * defaultLines / 5)))
 
 
+@contextmanager
+def runMain(options):
+    """
+    make sure the output file is deleted every time main is run
+    """
+    main(options)
+    yield
+    try:
+        os.remove(options.outputFile)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            pass
+        else:
+            raise
+
+
+@slow
 class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
     """
     Tests Toil by sorting a file in parallel on various combinations of job stores and batch
@@ -80,7 +101,7 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
 
         :param lineLen: the length of each random line in the file
         """
-        for test in xrange(testNo):
+        for test in range(testNo):
             try:
                 # Specify options
                 options = Job.Runner.getDefaultOptions(jobStoreLocator)
@@ -91,46 +112,48 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
                 options.badWorker = badWorker
                 options.badWorkerFailInterval = 0.05
                 options.disableCaching = disableCaching
+                # This is required because mesosMasterAddress now defaults to the IP of the machine
+                # that is starting the workflow while the mesos *tests* run locally.
+                if batchSystem == 'mesos':
+                    options.mesosMasterAddress = 'localhost:5050'
+                options.downCheckpoints = downCheckpoints
+                options.N = N
+                options.outputFile = os.path.join(self.tempDir, 'sortedFile.txt')
+                options.overwriteOutput = True
 
                 # Make the file to sort
                 tempSortFile = os.path.join(self.tempDir, "fileToSort.txt")
                 makeFileToSort(tempSortFile, lines=lines, lineLen=lineLen)
+                options.fileToSort = tempSortFile
 
                 # First make our own sorted version
                 with open(tempSortFile, 'r') as fileHandle:
                     l = fileHandle.readlines()
                     l.sort()
 
-                # Make the first job
-                firstJob = Job.wrapJobFn(setup, tempSortFile, N, downCheckpoints=downCheckpoints, memory=sortMemory,
-                                         name=tempSortFile)
-
                 # Check we get an exception if we try to restart a workflow that doesn't exist
                 options.restart = True
-                try:
-                    with Toil(options) as toil:
-                        toil.restart()
-                    self.fail()
-                except NoSuchJobStoreException:
-                    pass
+                with self.assertRaises(NoSuchJobStoreException):
+                    with runMain(options):
+                        # Now check the file is properly sorted..
+                        with open(options.outputFile, 'r') as fileHandle:
+                            l2 = fileHandle.readlines()
+                            self.assertEquals(l, l2)
 
                 options.restart = False
 
                 # Now actually run the workflow
                 try:
-                    with Toil(options) as toil:
-                        toil.start(firstJob)
+                    with runMain(options):
+                        pass
                     i = 0
                 except FailedJobsException as e:
                     i = e.numberOfFailedJobs
 
                 # Check we get an exception if we try to run without restart on an existing store
-                try:
-                    with Toil(options) as toil:
-                        toil.start(firstJob)
-                    self.fail()
-                except JobStoreExistsException:
-                    pass
+                with self.assertRaises(JobStoreExistsException):
+                    with runMain(options):
+                        pass
 
                 options.restart = True
 
@@ -139,31 +162,20 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
                 while i != 0:
                     options.useExistingOptions = random.random() > 0.5
                     try:
-                        with Toil(options) as toil:
-                            toil.restart()
+                        with runMain(options):
+                            pass
                         i = 0
                     except FailedJobsException as e:
                         i = e.numberOfFailedJobs
-                        if totalTrys > 32: #p(fail after this many restarts) = 0.5**32
-                            self.fail() #Exceeded a reasonable number of restarts
+                        if totalTrys > 32:  # p(fail after this many restarts) = 0.5**32
+                            self.fail('Exceeded a reasonable number of restarts')
                         totalTrys += 1
-
-                # Now check that if you try to restart from here it will raise an exception
-                # indicating that there are no jobs remaining in the workflow.
-                try:
-                    with Toil(options) as toil:
-                        toil.restart()
-                except JobException:
-                    pass
-                else:
-                    self.fail('Expected %s to be raised' % JobException )
-
-                # Now check the file is properly sorted..
-                with open(tempSortFile, 'r') as fileHandle:
-                    l2 = fileHandle.readlines()
-                    self.assertEquals(l, l2)
             finally:
                 subprocess.check_call([resolveEntryPoint('toil'), 'clean', jobStoreLocator])
+                # final test to make sure the jobStore was actually deleted
+                self.assertRaises(NoSuchJobStoreException, Toil.resumeJobStore, jobStoreLocator)
+
+
 
     @needs_aws
     def testAwsSingle(self):
@@ -199,12 +211,10 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
         finally:
             self._stopMesos()
 
-    @experimental
     @needs_google
     def testGoogleSingle(self):
         self._toilSort(jobStoreLocator=self._googleJobStore(), batchSystem="singleMachine")
 
-    @experimental
     @needs_google
     @needs_mesos
     def testGoogleMesos(self):
@@ -222,7 +232,8 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
                        disableCaching=True)
 
     def testFileSingleCheckpoints(self):
-        self._toilSort(jobStoreLocator=self._getTestJobStorePath(), batchSystem='singleMachine', retryCount=2, downCheckpoints=True)
+        self._toilSort(jobStoreLocator=self._getTestJobStorePath(), batchSystem='singleMachine',
+                       retryCount=2, downCheckpoints=True)
 
     def testFileSingle10000(self):
         self._toilSort(jobStoreLocator=self._getTestJobStorePath(), batchSystem='singleMachine',
@@ -252,7 +263,7 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
     testNo = 5
 
     def testSort(self):
-        for test in xrange(self.testNo):
+        for test in range(self.testNo):
             tempFile1 = os.path.join(self.tempDir, "fileToSort.txt")
             makeFileToSort(tempFile1)
             lines1 = self._loadFile(tempFile1)
@@ -263,7 +274,7 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
             self.assertEquals(lines1, lines2)
 
     def testMerge(self):
-        for test in xrange(self.testNo):
+        for test in range(self.testNo):
             tempFile1 = os.path.join(self.tempDir, "fileToSort1.txt")
             tempFile2 = os.path.join(self.tempDir, "fileToSort2.txt")
             tempFile3 = os.path.join(self.tempDir, "mergedFile.txt")
@@ -282,14 +293,14 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
             self.assertEquals(lines1, lines2)
 
     def testCopySubRangeOfFile(self):
-        for test in xrange(self.testNo):
+        for test in range(self.testNo):
             tempFile = os.path.join(self.tempDir, "fileToSort1.txt")
             outputFile = os.path.join(self.tempDir, "outputFileToSort1.txt")
             makeFileToSort(tempFile, lines=10, lineLen=defaultLineLen)
             fileSize = os.path.getsize(tempFile)
             assert fileSize > 0
-            fileStart = random.choice(xrange(0, fileSize))
-            fileEnd = random.choice(xrange(fileStart, fileSize))
+            fileStart = random.choice(range(0, fileSize))
+            fileEnd = random.choice(range(fileStart, fileSize))
             fileHandle = open(outputFile, 'w')
             copySubRangeOfFile(tempFile, fileStart, fileEnd, fileHandle)
             fileHandle.close()
@@ -298,7 +309,7 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
             self.assertEquals(l, l2)
 
     def testGetMidPoint(self):
-        for test in xrange(self.testNo):
+        for test in range(self.testNo):
             tempFile = os.path.join(self.tempDir, "fileToSort.txt")
             makeFileToSort(tempFile)
             l = open(tempFile, 'r').read()
@@ -315,18 +326,13 @@ class SortTest(ToilTest, MesosTestSupport, ParasolTestSupport):
         return 'aws:%s:sort-test-%s' % (self.awsRegion(), uuid4())
 
     def _azureJobStore(self):
-        return "azure:toiltest:sort-test-%s" % uuid4()
+        accountName = os.getenv('TOIL_AZURE_KEYNAME')
+        return "azure:%s:sort-test-%s" % (accountName, uuid4())
 
     def _googleJobStore(self):
-        return "google:cgc-05-0006:sort-test-%s" % uuid4()
+        projectID = os.getenv('TOIL_GOOGLE_PROJECTID')
+        return 'google:%s:sort-test-%s' % (projectID, str(uuid4()))
 
     def _loadFile(self, path):
         with open(path, 'r') as f:
             return f.readlines()
-
-
-def makeFileToSort(fileName, lines=defaultLines, lineLen=defaultLineLen):
-    with open(fileName, 'w') as fileHandle:
-        for _ in xrange(lines):
-            line = "".join(random.choice('actgACTGNXYZ') for _ in xrange(lineLen - 1)) + '\n'
-            fileHandle.write(line)

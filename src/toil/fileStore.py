@@ -13,6 +13,12 @@
 # limitations under the License.
 
 from __future__ import absolute_import, print_function
+from future import standard_library
+standard_library.install_aliases()
+from builtins import map
+from builtins import str
+from builtins import range
+from builtins import object
 from abc import abstractmethod, ABCMeta
 
 from bd2k.util.objects import abstractclassmethod
@@ -44,6 +50,7 @@ from bd2k.util.humanize import bytes2human
 from toil.common import cacheDirName, getDirSizeRecursively, getFileSystemSize
 from toil.lib.bioio import makePublicDir
 from toil.resource import ModuleDescriptor
+from future.utils import with_metaclass
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +77,7 @@ class DeferredFunction(namedtuple('DeferredFunction', 'function args kwargs name
         # concurrently running jobs when the cache state is loaded from disk. By implication we
         # should serialize as early as possible. We need to serialize the function as well as its
         # arguments.
-        return cls(*map(dill.dumps, (function, args, kwargs)),
+        return cls(*list(map(dill.dumps, (function, args, kwargs))),
                    name=function.__name__,
                    module=ModuleDescriptor.forModule(function.__module__).globalize())
 
@@ -80,7 +87,7 @@ class DeferredFunction(namedtuple('DeferredFunction', 'function args kwargs name
         """
         logger.debug('Running deferred function %s.', self)
         self.module.makeLoadable()
-        function, args, kwargs = map(dill.loads, (self.function, self.args, self.kwargs))
+        function, args, kwargs = list(map(dill.loads, (self.function, self.args, self.kwargs)))
         return function(*args, **kwargs)
 
     def __str__(self):
@@ -89,7 +96,7 @@ class DeferredFunction(namedtuple('DeferredFunction', 'function args kwargs name
     __repr__ = __str__
 
 
-class FileStore(object):
+class FileStore(with_metaclass(ABCMeta, object)):
     """
     An abstract base class to represent the interface between a worker and the job store.  Concrete
     subclasses will be used to manage temporary files, read and write files from the job store and
@@ -99,8 +106,6 @@ class FileStore(object):
     _pendingFileWritesLock = Semaphore()
     _pendingFileWrites = set()
     _terminateEvent = Event()  # Used to signify crashes in threads
-
-    __metaclass__ = ABCMeta
 
     def __init__(self, jobStore, jobGraph, localTempDir, inputBlockFn):
         self.jobStore = jobStore
@@ -196,9 +201,12 @@ class FileStore(object):
         return self.jobStore.writeFileStream(None if not cleanup else self.jobGraph.jobStoreID)
 
     @abstractmethod
-    def readGlobalFile(self, fileStoreID, userPath=None, cache=True, mutable=None):
+    def readGlobalFile(self, fileStoreID, userPath=None, cache=True, mutable=False, symlink=False):
         """
-        Downloads a file described by fileStoreID from the file store to the local directory.
+        Makes the file associated with fileStoreID available locally. If mutable is True,
+        then a copy of the file will be created locally so that the original is not modified
+        and does not change the file for other jobs. If mutable is False, then a link can
+        be created to the file, saving disk resources.
 
         If a user path is specified, it is used as the destination. If a user path isn't
         specified, the file is stored in the local temp directory with an encoded name.
@@ -206,8 +214,8 @@ class FileStore(object):
         :param toil.fileStore.FileID fileStoreID: job store id for the file
         :param string userPath: a path to the name of file to which the global file will be copied
                or hard-linked (see below).
-        :param bool cache: Described in :func:`~toil.fileStore.FileStore.readGlobalFile`
-        :param bool mutable: Described in :func:`~toil.fileStore.FileStore.readGlobalFile`
+        :param bool cache: Described in :func:`toil.fileStore.CachingFileStore.readGlobalFile`
+        :param bool mutable: Described in :func:`toil.fileStore.CachingFileStore.readGlobalFile`
         :return: An absolute path to a local, temporary copy of the file keyed by fileStoreID.
         :rtype: str
         """
@@ -432,9 +440,7 @@ class CachingFileStore(FileStore):
         self.workerNumber = 2
         self.queue = Queue()
         self.updateSemaphore = Semaphore()
-        self.mutable = self.jobStore.config.readGlobalFileMutableByDefault
-        self.workers = map(lambda i: Thread(target=self.asyncWrite),
-                           range(self.workerNumber))
+        self.workers = [Thread(target=self.asyncWrite) for i in range(self.workerNumber)]
         for worker in self.workers:
             worker.start()
         # Variables related to caching
@@ -536,8 +542,8 @@ class CachingFileStore(FileStore):
             # from the file store. In that case, you want to copy to the file store so that
             # the two have distinct nlink counts.
             # Can read without a lock because we're only reading job-specific info.
-            jobSpecificFiles = self._CacheState._load(self.cacheStateFile).jobState[
-                self.jobID]['filesToFSIDs'].keys()
+            jobSpecificFiles = list(self._CacheState._load(self.cacheStateFile).jobState[
+                self.jobID]['filesToFSIDs'].keys())
             # Saying nlink is 2 implicitly means we are using the job file store, and it is on
             # the same device as the work dir.
             if self.nlinkThreshold == 2 and absLocalFileName not in jobSpecificFiles:
@@ -589,7 +595,7 @@ class CachingFileStore(FileStore):
         # TODO: Make this work with caching
         return super(CachingFileStore, self).writeGlobalFileStream(cleanup)
 
-    def readGlobalFile(self, fileStoreID, userPath=None, cache=True, mutable=None):
+    def readGlobalFile(self, fileStoreID, userPath=None, cache=True, mutable=False, symlink=False):
         """
         Downloads a file described by fileStoreID from the file store to the local directory.
         The function first looks for the file in the cache and if found, it hardlinks to the
@@ -604,16 +610,12 @@ class CachingFileStore(FileStore):
                complete.
         :param bool mutable: If True, the file path returned points to a file that is
                modifiable by the user. Using False is recommended as it saves disk by making
-               multiple workers share a file via hard links. The default is False unless backwards
-               compatibility was requested.
+               multiple workers share a file via hard links. The default is False.
         """
         # Check that the file hasn't been deleted by the user
         if fileStoreID in self.filesToDelete:
             raise RuntimeError('Trying to access a file in the jobStore you\'ve deleted: ' + \
                                '%s' % fileStoreID)
-        # Set up the modifiable variable if it wasn't provided by the user in the function call.
-        if mutable is None:
-            mutable = self.mutable
         # Get the name of the file as it would be in the cache
         cachedFileName = self.encodedFileID(fileStoreID)
         # setup the harbinger variable for the file.  This is an identifier that the file is
@@ -750,13 +752,13 @@ class CachingFileStore(FileStore):
         # False.
         with self._CacheState.open(self) as cacheInfo:
             jobState = self._JobState(cacheInfo.jobState[self.jobID])
-            if fileStoreID not in jobState.jobSpecificFiles.keys():
+            if fileStoreID not in list(jobState.jobSpecificFiles.keys()):
                 # EOENT indicates that the file did not exist
                 raise OSError(errno.ENOENT, "Attempting to delete a non-local file")
             # filesToDelete is a dictionary of file: fileSize
             filesToDelete = jobState.jobSpecificFiles[fileStoreID]
             allOwnedFiles = jobState.filesToFSIDs
-            for (fileToDelete, fileSize) in filesToDelete.items():
+            for (fileToDelete, fileSize) in list(filesToDelete.items()):
                 # Handle the case where a file not in the local temp dir was written to
                 # filestore
                 if fileToDelete is None:
@@ -823,7 +825,7 @@ class CachingFileStore(FileStore):
             if self.jobID in cacheInfo.jobState:
                 jobState = self._JobState(cacheInfo.jobState[self.jobID])
                 jobStateIsPopulated = True
-        if jobStateIsPopulated and fileStoreID in jobState.jobSpecificFiles.keys():
+        if jobStateIsPopulated and fileStoreID in list(jobState.jobSpecificFiles.keys()):
             # Use deleteLocalFile in the backend to delete the local copy of the file.
             self.deleteLocalFile(fileStoreID)
             # At this point, the local file has been deleted, and possibly the cached copy. If
@@ -961,9 +963,12 @@ class CachingFileStore(FileStore):
         """
         fileDir, fileName = os.path.split(cachedFilePath)
         assert fileDir == self.localCacheDir, 'Can\'t decode uncached file names'
-        return base64.urlsafe_b64decode(fileName)
+        # We convert to byes here because base64 can't work with unicode
+        # Its probably worth, later, converting all file name variables to str
+        # rather than unicode.
+        return base64.urlsafe_b64decode(bytes(fileName))
 
-    def addToCache(self, localFilePath, jobStoreFileID, callingFunc, mutable=None):
+    def addToCache(self, localFilePath, jobStoreFileID, callingFunc, mutable=False):
         """
         Used to process the caching of a file. This depends on whether a file is being written
         to file store, or read from it.
@@ -980,10 +985,6 @@ class CachingFileStore(FileStore):
         :param bool mutable: See modifiable in readGlobalFile
         """
         assert callingFunc in ('read', 'write')
-        # Set up the modifiable variable if it wasn't provided by the user in the function call.
-        if mutable is None:
-            mutable = self.mutable
-        assert isinstance(mutable, bool)
         with self.cacheLock() as lockFileHandle:
             cachedFile = self.encodedFileID(jobStoreFileID)
             # The file to be cached MUST originate in the environment of the TOIL temp directory
@@ -1090,7 +1091,7 @@ class CachingFileStore(FileStore):
         :return: A boolean indicating whether the file is hidden or not.
         :rtype: bool
         """
-        assert isinstance(filePath, str)
+        assert isinstance(filePath, (str, bytes))
         # I can safely assume i will never see an empty string because this is always called on
         # the results of an os.listdir()
         return filePath[0] in ('.', '_')
@@ -1217,7 +1218,7 @@ class CachingFileStore(FileStore):
         # need a lock
         jobState = self._JobState(self._CacheState._load(self.cacheStateFile
                                                          ).jobState[self.jobID])
-        for x in jobState.jobSpecificFiles.keys():
+        for x in list(jobState.jobSpecificFiles.keys()):
             self.deleteLocalFile(x)
         with self._CacheState.open(self) as cacheInfo:
             cacheInfo.sigmaJob -= jobReqs
@@ -1276,7 +1277,7 @@ class CachingFileStore(FileStore):
                a _CacheState object
         """
         # A list of tuples of (hashed job id, pid or process running job)
-        registeredJobs = [(jid, state['pid']) for jid, state in nodeInfo.jobState.items()]
+        registeredJobs = [(jid, state['pid']) for jid, state in list(nodeInfo.jobState.items())]
         for jobID, jobPID in registeredJobs:
             if not cls._pidExists(jobPID):
                 jobState = CachingFileStore._JobState(nodeInfo.jobState[jobID])
@@ -1504,7 +1505,7 @@ class CachingFileStore(FileStore):
         def asyncUpdate():
             try:
                 # Wait till all file writes have completed
-                for i in xrange(len(self.workers)):
+                for i in range(len(self.workers)):
                     self.queue.put(None)
 
                 for thread in self.workers:
@@ -1528,10 +1529,10 @@ class CachingFileStore(FileStore):
                 self.jobStore.update(self.jobGraph)
 
                 # Delete any remnant jobs
-                map(self.jobStore.delete, self.jobsToDelete)
+                list(map(self.jobStore.delete, self.jobsToDelete))
 
                 # Delete any remnant files
-                map(self.jobStore.deleteFile, self.filesToDelete)
+                list(map(self.jobStore.deleteFile, self.filesToDelete))
 
                 # Remove the files to delete list, having successfully removed the files
                 if len(self.filesToDelete) > 0:
@@ -1579,7 +1580,7 @@ class CachingFileStore(FileStore):
         file writing threads exit.
         """
         self.updateSemaphore.acquire()
-        for i in xrange(len(self.workers)):
+        for i in range(len(self.workers)):
             self.queue.put(None)
         for thread in self.workers:
             thread.join()
@@ -1628,7 +1629,7 @@ class NonCachingFileStore(FileStore):
                                            requestedDisk=jobReqs))
             self.logToMaster(logString, level=logging.DEBUG)
             if diskUsed > jobReqs:
-                self.logToMaster("Job used more disk than requested. Cconsider modifying the user "
+                self.logToMaster("Job used more disk than requested. Consider modifying the user "
                                  "script to avoid the chance of failure due to incorrectly "
                                  "requested resources. " + logString, level=logging.WARNING)
             os.chdir(startingDir)
@@ -1647,7 +1648,7 @@ class NonCachingFileStore(FileStore):
         self.localFileMap[fileStoreID].append(absLocalFileName)
         return FileID.forPath(fileStoreID, absLocalFileName)
 
-    def readGlobalFile(self, fileStoreID, userPath=None, cache=True, mutable=None):
+    def readGlobalFile(self, fileStoreID, userPath=None, cache=True, mutable=False, symlink=False):
         if userPath is not None:
             localFilePath = self._resolveAbsoluteLocalPath(userPath)
             if os.path.exists(localFilePath):
@@ -1655,7 +1656,7 @@ class NonCachingFileStore(FileStore):
         else:
             localFilePath = self.getLocalTempFileName()
 
-        self.jobStore.readFile(fileStoreID, localFilePath)
+        self.jobStore.readFile(fileStoreID, localFilePath, symlink=symlink)
         self.localFileMap[fileStoreID].append(localFilePath)
         return localFilePath
 
@@ -1699,9 +1700,9 @@ class NonCachingFileStore(FileStore):
             # Complete the job
             self.jobStore.update(self.jobGraph)
             # Delete any remnant jobs
-            map(self.jobStore.delete, self.jobsToDelete)
+            list(map(self.jobStore.delete, self.jobsToDelete))
             # Delete any remnant files
-            map(self.jobStore.deleteFile, self.filesToDelete)
+            list(map(self.jobStore.deleteFile, self.filesToDelete))
             # Remove the files to delete list, having successfully removed the files
             if len(self.filesToDelete) > 0:
                 self.jobGraph.filesToDelete = []

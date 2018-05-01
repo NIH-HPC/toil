@@ -16,7 +16,7 @@ import os
 from collections import namedtuple
 from operator import attrgetter
 import datetime
-from cgcloud.lib.util import std_dev, mean
+from toil.lib.misc import std_dev, mean
 
 from toil.test import runningOnEC2
 
@@ -111,8 +111,7 @@ def choose_spot_zone(zones, bid, spot_history):
     #
     markets_under_bid, markets_over_bid = [], []
     for zone in zones:
-        zone_histories = filter(lambda zone_history:
-                                zone_history.availability_zone == zone.name, spot_history)
+        zone_histories = [zone_history for zone_history in spot_history if zone_history.availability_zone == zone.name]
         if zone_histories:
             price_deviation = std_dev([history.price for history in zone_histories])
             recent_price = zone_histories[0].price
@@ -196,104 +195,3 @@ sdbFullPolicy = dict(Version="2012-10-17", Statement=[
 
 iamFullPolicy = dict(Version="2012-10-17", Statement=[
     dict(Effect="Allow", Resource="*", Action="iam:*")])
-
-
-logDir = '--log_dir=/var/lib/mesos'
-leaderArgs = logDir + ' --registry=in_memory --cluster={name}'
-workerArgs = '{keyPath} --work_dir=/var/lib/mesos --master={ip}:5050 --attributes=preemptable:{preemptable} ' + logDir
-
-awsUserData = """#cloud-config
-
-write_files:
-    - path: "/home/core/volumes.sh"
-      permissions: "0777"
-      owner: "root"
-      content: |
-        #!/bin/bash
-        set -x
-        ephemeral_count=0
-        possible_drives="/dev/xvdb /dev/xvdc /dev/xvdd /dev/xvde"
-        drives=""
-        directories="toil mesos docker"
-        for drive in $possible_drives; do
-            echo checking for $drive
-            if [ -b $drive ]; then
-                echo found it
-                ephemeral_count=$((ephemeral_count + 1 ))
-                drives="$drives $drive"
-                echo increased ephemeral count by one
-            fi
-        done
-        if (("$ephemeral_count" == "0" )); then
-            echo no ephemeral drive
-            for directory in $directories; do
-                sudo mkdir -p /var/lib/$directory
-            done
-            exit 0
-        fi
-        sudo mkdir /mnt/ephemeral
-        if (("$ephemeral_count" == "1" )); then
-            echo one ephemeral drive to mount
-            sudo mkfs.ext4 -F $drives
-            sudo mount $drives /mnt/ephemeral
-        fi
-        if (("$ephemeral_count" > "1" )); then
-            echo multiple drives
-            for drive in $drives; do
-                dd if=/dev/zero of=$drive bs=4096 count=1024
-            done
-            sudo mdadm --create -f --verbose /dev/md0 --level=0 --raid-devices=$ephemeral_count $drives # determine force flag
-            sudo mkfs.ext4 -F /dev/md0
-            sudo mount /dev/md0 /mnt/ephemeral
-        fi
-        for directory in $directories; do
-            sudo mkdir -p /mnt/ephemeral/var/lib/$directory
-            sudo mkdir -p /var/lib/$directory
-            sudo mount --bind /mnt/ephemeral/var/lib/$directory /var/lib/$directory
-        done
-
-coreos:
-    update:
-      reboot-strategy: off
-    units:
-    - name: "volume-mounting.service"
-      command: "start"
-      content: |
-        [Unit]
-        Description=mounts ephemeral volumes & bind mounts toil directories
-        Author=cketchum@ucsc.edu
-        Before=docker.service
-
-        [Service]
-        Type=oneshot
-        Restart=no
-        ExecStart=/usr/bin/bash /home/core/volumes.sh
-
-    - name: "toil-{role}.service"
-      command: "start"
-      content: |
-        [Unit]
-        Description=toil-{role} container
-        Author=cketchum@ucsc.edu
-        After=docker.service
-
-        [Service]
-        Restart=on-failure
-        RestartSec=2
-        ExecPre=-/usr/bin/docker rm toil_{role}
-        ExecStart=/usr/bin/docker run \
-            --entrypoint={entrypoint} \
-            --net=host \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v /var/lib/mesos:/var/lib/mesos \
-            -v /var/lib/docker:/var/lib/docker \
-            -v /var/lib/toil:/var/lib/toil \
-            -v /var/lib/cwl:/var/lib/cwl \
-            -v /tmp:/tmp \
-            --name=toil_{role} \
-            {image} \
-            {args}
-
-ssh_authorized_keys:
-    - "ssh-rsa {sshKey}"
-"""

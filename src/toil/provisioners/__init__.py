@@ -12,63 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import absolute_import
-import datetime
+
 import logging
-import os
-
-from bd2k.util import parse_iso_utc, less_strict_bool
-
-
 logger = logging.getLogger(__name__)
 
 
-def awsRemainingBillingInterval(instance):
-    def partialBillingInterval(instance):
-        """
-        Returns a floating point value between 0 and 1.0 representing how far we are into the
-        current billing cycle for the given instance. If the return value is .25, we are one
-        quarter into the billing cycle, with three quarters remaining before we will be charged
-        again for that instance.
-        """
-        launch_time = parse_iso_utc(instance.launch_time)
-        now = datetime.datetime.utcnow()
-        delta = now - launch_time
-        return delta.total_seconds() / 3600.0 % 1.0
-
-    return 1.0 - partialBillingInterval(instance)
-
-
-def awsFilterImpairedNodes(nodes, ec2):
-    # if TOIL_AWS_NODE_DEBUG is set don't terminate nodes with
-    # failing status checks so they can be debugged
-    nodeDebug = less_strict_bool(os.environ.get('TOIL_AWS_NODE_DEBUG'))
-    if not nodeDebug:
-        return nodes
-    nodeIDs = [node.id for node in nodes]
-    statuses = ec2.get_all_instance_status(instance_ids=nodeIDs)
-    statusMap = {status.id: status.instance_status for status in statuses}
-    healthyNodes = [node for node in nodes if statusMap.get(node.id, None) != 'impaired']
-    impairedNodes = [node.id for node in nodes if statusMap.get(node.id, None) == 'impaired']
-    logger.warn('TOIL_AWS_NODE_DEBUG is set and nodes %s have failed EC2 status checks so '
-                'will not be terminated.', ' '.join(impairedNodes))
-    return healthyNodes
-
-
-class Cluster(object):
-    def __init__(self, clusterName, provisioner, zone=None):
-        self.clusterName = clusterName
-        self.zone = zone
-        if provisioner == 'aws':
+def clusterFactory(provisioner, clusterName=None, zone=None, nodeStorage=50, sseKey=None):
+    """
+    :param clusterName: The name of the cluster.
+    :param provisioner: The cloud type of the cluster.
+    :param zone: The cloud zone
+    :return: A cluster object for the the cloud type.
+    """
+    if provisioner == 'aws':
+        try:
             from toil.provisioners.aws.awsProvisioner import AWSProvisioner
-            self.provisioner = AWSProvisioner
-        else:
-            assert False, "Invalid provisioner '%s'" % provisioner
+            from bd2k.util.ec2.credentials import enable_metadata_credential_caching
+        except ImportError:
+            logger.error('The aws extra must be installed to use this provisioner')
+            raise
+        enable_metadata_credential_caching() # monkey patch for AWS
+        return AWSProvisioner(clusterName, zone, nodeStorage, sseKey)
+    elif provisioner == 'gce':
+        try:
+            from toil.provisioners.gceProvisioner import GCEProvisioner
+        except ImportError:
+            logger.error('The google extra must be installed to use this provisioner')
+            raise
+        return GCEProvisioner(clusterName, zone, nodeStorage, sseKey)
+    elif provisioner == 'azure':
+        try:
+            from toil.provisioners.azure.azureProvisioner import AzureProvisioner
+        except ImportError:
+            logger.error('The azure extra must be installed to use this provisioner')
+            raise
+        return AzureProvisioner(clusterName, zone, nodeStorage)
+    else:
+        raise RuntimeError("Invalid provisioner '%s'" % provisioner)
 
-    def sshCluster(self, args):
-        self.provisioner.sshLeader(self.clusterName, args, self.zone)
-
-    def rsyncCluster(self, args):
-        self.provisioner.rsyncLeader(self.clusterName, args, self.zone)
-
-    def destroyCluster(self):
-        self.provisioner.destroyCluster(self.clusterName, self.zone)
+class NoSuchClusterException(Exception):
+    """Indicates that the specified cluster does not exist."""
+    def __init__(self, clusterName):
+        super(NoSuchClusterException, self).__init__("The cluster '%s' could not be found" % clusterName)

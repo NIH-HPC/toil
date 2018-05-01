@@ -13,6 +13,12 @@
 # limitations under the License.
 
 from __future__ import absolute_import
+from __future__ import division
+from builtins import map
+from builtins import str
+from builtins import range
+from builtins import object
+from past.utils import old_div
 from abc import ABCMeta, abstractmethod
 from fractions import Fraction
 from inspect import getsource
@@ -25,7 +31,7 @@ from textwrap import dedent
 import time
 import multiprocessing
 import sys
-import subprocess
+from toil import subprocess
 from unittest import skipIf
 
 from toil.common import Config
@@ -34,16 +40,19 @@ from toil.batchSystems.parasolTestSupport import ParasolTestSupport
 from toil.batchSystems.parasol import ParasolBatchSystem
 from toil.batchSystems.singleMachine import SingleMachineBatchSystem
 from toil.batchSystems.abstractBatchSystem import (InsufficientSystemResources,
-                                                   AbstractBatchSystem,
                                                    BatchSystemSupport)
 from toil.job import Job, JobNode
 from toil.test import (ToilTest,
+                       needs_lsf,
                        needs_mesos,
                        needs_parasol,
                        needs_gridengine,
                        needs_slurm,
                        needs_torque,
+                       needs_htcondor,
+                       slow,
                        tempFileContaining)
+from future.utils import with_metaclass
 
 log = logging.getLogger(__name__)
 
@@ -57,18 +66,17 @@ preemptable = False
 defaultRequirements = dict(memory=int(100e6), cores=1, disk=1000, preemptable=preemptable)
 
 
-class hidden:
+class hidden(object):
     """
     Hide abstract base class from unittest's test case loader
 
     http://stackoverflow.com/questions/1323455/python-unit-test-with-base-and-sub-class#answer-25695512
     """
 
-    class AbstractBatchSystemTest(ToilTest):
+    class AbstractBatchSystemTest(with_metaclass(ABCMeta, ToilTest)):
         """
         A base test case with generic tests that every batch system should pass
         """
-        __metaclass__ = ABCMeta
 
         @abstractmethod
         def createBatchSystem(self):
@@ -159,6 +167,8 @@ class hidden:
                 self.assertTrue(wallTime > 0)
             else:
                 self.assertIsNone(wallTime)
+            if not os.path.exists(testPath):
+                time.sleep(20)
             self.assertTrue(os.path.exists(testPath))
             self.assertFalse(self.batchSystem.getUpdatedBatchJob(0))
 
@@ -173,7 +183,7 @@ class hidden:
             # invoke that script rather than inline the test via -c.
             def assertEnv():
                 import os, sys
-                sys.exit(0 if os.getenv('FOO') == 'bar' else 42)
+                sys.exit(23 if os.getenv('FOO') == 'bar' else 42)
 
             script_body = dedent('\n'.join(getsource(assertEnv).split('\n')[1:]))
             with tempFileContaining(script_body, suffix='.py') as script_path:
@@ -191,7 +201,7 @@ class hidden:
                                    jobStoreID='5', requirements=defaultRequirements)
                 job5 = self.batchSystem.issueBatchJob(jobNode5)
                 jobID, exitStatus, wallTime = self.batchSystem.getUpdatedBatchJob(maxWait=1000)
-                self.assertEqual(exitStatus, 0)
+                self.assertEqual(exitStatus, 23)
                 self.assertEqual(jobID, job5)
 
         def testCheckResourceRequest(self):
@@ -211,9 +221,6 @@ class hidden:
                                   memory=10, cores=None, disk=1000)
                 checkResourceRequest(memory=10, cores=1, disk=100)
 
-        def testGetRescueJobFrequency(self):
-            self.assertTrue(self.batchSystem.getRescueBatchJobFrequency() > 0)
-
         def testScalableBatchSystem(self):
             # If instance of scalable batch system
             pass
@@ -231,19 +238,17 @@ class hidden:
             runningIDs = []
             # prevent an endless loop, give it 20 tries
             for it in range(20):
-                runningIDs = self.batchSystem.getRunningBatchJobIDs().keys()
+                runningIDs = list(self.batchSystem.getRunningBatchJobIDs().keys())
                 if len(runningIDs) == numJobs:
                     break
                 time.sleep(1)
             return runningIDs
 
-    class AbstractBatchSystemJobTest(ToilTest):
+    class AbstractBatchSystemJobTest(with_metaclass(ABCMeta, ToilTest)):
         """
         An abstract base class for batch system tests that use a full Toil workflow rather
         than using the batch system directly.
         """
-
-        __metaclass__ = ABCMeta
 
         cpuCount = multiprocessing.cpu_count()
         allocatedCores = sorted({1, 2, cpuCount})
@@ -256,6 +261,19 @@ class hidden:
             """
             raise NotImplementedError
 
+        def getOptions(self, tempDir):
+            """
+            Configures options for Toil workflow and makes job store.
+            :param str tempDir: path to test directory
+            :return: Toil options object
+            """
+            options = Job.Runner.getDefaultOptions(self._getTestJobStorePath())
+            options.logLevel = "DEBUG"
+            options.batchSystem = self.batchSystemName
+            options.workDir = tempDir
+            options.maxCores = self.cpuCount
+            return options
+
         def setUp(self):
             self.batchSystemName = self.getBatchSystemName()
             super(hidden.AbstractBatchSystemJobTest, self).setUp()
@@ -263,17 +281,14 @@ class hidden:
         def tearDown(self):
             super(hidden.AbstractBatchSystemJobTest, self).tearDown()
 
+        @slow
         def testJobConcurrency(self):
             """
             Tests that the batch system is allocating core resources properly for concurrent tasks.
             """
             for coresPerJob in self.allocatedCores:
                 tempDir = self._createTempDir('testFiles')
-
-                options = Job.Runner.getDefaultOptions(self._getTestJobStorePath())
-                options.workDir = tempDir
-                options.maxCores = self.cpuCount
-                options.batchSystem = self.batchSystemName
+                options = self.getOptions(tempDir)
 
                 counterPath = os.path.join(tempDir, 'counter')
                 resetCounters(counterPath)
@@ -286,7 +301,7 @@ class hidden:
                                                 cores=coresPerJob, memory='1M', disk='1Mi'))
                 Job.Runner.startToil(root, options)
                 _, maxValue = getCounters(counterPath)
-                self.assertEqual(maxValue, self.cpuCount / coresPerJob)
+                self.assertEqual(maxValue, old_div(self.cpuCount, coresPerJob))
 
     class AbstractGridEngineBatchSystemTest(AbstractBatchSystemTest):
         """
@@ -300,23 +315,21 @@ class hidden:
             config.jobStore = 'file:' + self._createTempDir('jobStore')
             return config
 
-        def testResultFile(self):
-            """
-            Tests that the result file name is formatted properly
-            """
-            # noinspection PyUnresolvedReferences
-            fileName = self.batchSystem._getResultsFileName(self.config.jobStore)
-            filePath, _ = os.path.split(fileName)  # removes file so dir matches config.jobStore
-            locator = self.config.jobStore
-            self.assertTrue(locator.startswith('file:'))
-            self.assertEqual(locator[len('file:'):], filePath)
-
-
+@slow
 @needs_mesos
 class MesosBatchSystemTest(hidden.AbstractBatchSystemTest, MesosTestSupport):
     """
     Tests against the Mesos batch system
     """
+
+    def createConfig(cls):
+        """
+        needs to set mesosMasterAddress to localhost for testing since the default is now the
+        private IP address
+        """
+        config = super(MesosBatchSystemTest, cls).createConfig()
+        config.mesosMasterAddress = 'localhost:5050'
+        return config
 
     def supportsWallTime(self):
         return True
@@ -325,12 +338,24 @@ class MesosBatchSystemTest(hidden.AbstractBatchSystemTest, MesosTestSupport):
         from toil.batchSystems.mesos.batchSystem import MesosBatchSystem
         self._startMesos(numCores)
         return MesosBatchSystem(config=self.config,
-                                maxCores=numCores, maxMemory=1e9, maxDisk=1001,
-                                masterAddress='127.0.0.1:5050')
+                                maxCores=numCores, maxMemory=1e9, maxDisk=1001)
 
     def tearDown(self):
         self._stopMesos()
         super(MesosBatchSystemTest, self).tearDown()
+
+    def testIgnoreNode(self):
+        self.batchSystem.ignoreNode('localhost')
+        jobNode = JobNode(command='sleep 1000', jobName='test2', unitName=None,
+                           jobStoreID='1', requirements=defaultRequirements)
+        job = self.batchSystem.issueBatchJob(jobNode)
+
+        issuedID = self._waitForJobsToIssue(1)
+        self.assertEqual(set(issuedID), {job})
+
+        runningJobIDs = self._waitForJobsToStart(1)
+        # Make sure job is NOT running
+        self.assertEqual(set(runningJobIDs), set({}))
 
 
 class SingleMachineBatchSystemTest(hidden.AbstractBatchSystemTest):
@@ -346,9 +371,10 @@ class SingleMachineBatchSystemTest(hidden.AbstractBatchSystemTest):
                                         maxCores=numCores, maxMemory=1e9, maxDisk=2001)
 
 
+@slow
 class MaxCoresSingleMachineBatchSystemTest(ToilTest):
     """
-    This test ensures that single machine batch system doesn't exceed the configured number of
+    This test ensures that single machine batch system doesn't exceed the configured number
     cores
     """
 
@@ -388,7 +414,7 @@ class MaxCoresSingleMachineBatchSystemTest(ToilTest):
                     fcntl.flock(fd, fcntl.LOCK_EX)
                     try:
                         s = os.read(fd, 10)
-                        value, maxValue = map(int, s.split(','))
+                        value, maxValue = list(map(int, s.split(',')))
                         value += delta
                         if value > maxValue: maxValue = value
                         os.lseek(fd, 0, 0)
@@ -464,10 +490,9 @@ class MaxCoresSingleMachineBatchSystemTest(ToilTest):
                                  'coresPerJob: {coresPerJob}, '
                                  'load: {load}'.format(**locals()))
                         # This is the key assertion:
-                        expectedMaxConcurrentTasks = min(maxCores / coresPerJob, jobs)
+                        expectedMaxConcurrentTasks = min(old_div(maxCores, coresPerJob), jobs)
                         self.assertEquals(maxConcurrentTasks, expectedMaxConcurrentTasks)
                         resetCounters(self.counterPath)
-
 
     @skipIf(SingleMachineBatchSystem.numCores < 3, 'Need at least three cores to run this test')
     def testServices(self):
@@ -519,6 +544,7 @@ class Service(Job.Service):
         subprocess.check_call(self.cmd + ' -1', shell=True)
 
 
+@slow
 @needs_parasol
 class ParasolBatchSystemTest(hidden.AbstractBatchSystemTest, ParasolTestSupport):
     """
@@ -537,6 +563,7 @@ class ParasolBatchSystemTest(hidden.AbstractBatchSystemTest, ParasolTestSupport)
     def createBatchSystem(self):
         memory = int(3e9)
         self._startParasol(numCores=numCores, memory=memory)
+
         return ParasolBatchSystem(config=self.config,
                                   maxCores=numCores,
                                   maxMemory=memory,
@@ -579,7 +606,6 @@ class ParasolBatchSystemTest(hidden.AbstractBatchSystemTest, ParasolTestSupport)
         memPattern = re.compile("(\d+\.\d+)([kgmbt])")
         items = batchString.split()
         batchInfo["cores"] = int(items[7])
-        name = str(items[11])
         memMatch = memPattern.match(items[8])
         ramValue = float(memMatch.group(1))
         ramUnits = memMatch.group(2)
@@ -594,6 +620,7 @@ class ParasolBatchSystemTest(hidden.AbstractBatchSystemTest, ParasolTestSupport)
         return [self._parseBatchString(line) for line in batchLines[1:] if line]
 
 
+@slow
 @needs_gridengine
 class GridEngineBatchSystemTest(hidden.AbstractGridEngineBatchSystemTest):
     """
@@ -612,6 +639,8 @@ class GridEngineBatchSystemTest(hidden.AbstractGridEngineBatchSystemTest):
         for f in glob('toil_job*.o*'):
             os.unlink(f)
 
+
+@slow
 @needs_slurm
 class SlurmBatchSystemTest(hidden.AbstractGridEngineBatchSystemTest):
     """
@@ -630,6 +659,20 @@ class SlurmBatchSystemTest(hidden.AbstractGridEngineBatchSystemTest):
         for f in glob('slurm-*.out'):
             os.unlink(f)
 
+
+@slow
+@needs_lsf
+class LSFBatchSystemTest(hidden.AbstractGridEngineBatchSystemTest):
+    """
+    Tests against the LSF batch system
+    """
+    def createBatchSystem(self):
+        from toil.batchSystems.lsf import LSFBatchSystem
+        return LSFBatchSystem(config=self.config, maxCores=numCores,
+                              maxMemory=1000e9, maxDisk=1e9)
+
+
+@slow
 @needs_torque
 class TorqueBatchSystemTest(hidden.AbstractGridEngineBatchSystemTest):
     """
@@ -654,6 +697,21 @@ class TorqueBatchSystemTest(hidden.AbstractGridEngineBatchSystemTest):
         for f in glob('toil_job_*.[oe]*'):
             os.unlink(f)
 
+@slow
+@needs_htcondor
+class HTCondorBatchSystemTest(hidden.AbstractGridEngineBatchSystemTest):
+    """
+    Tests against the HTCondor batch system
+    """
+
+    def createBatchSystem(self):
+        from toil.batchSystems.htcondor import HTCondorBatchSystem
+        return HTCondorBatchSystem(config=self.config, maxCores=numCores, maxMemory=1000e9,
+                                       maxDisk=1e9)
+
+    def tearDown(self):
+        super(HTCondorBatchSystemTest, self).tearDown()
+
 class SingleMachineBatchSystemJobTest(hidden.AbstractBatchSystemJobTest):
     """
     Tests Toil workflow against the SingleMachine batch system
@@ -662,6 +720,7 @@ class SingleMachineBatchSystemJobTest(hidden.AbstractBatchSystemJobTest):
     def getBatchSystemName(self):
         return "singleMachine"
 
+    @slow
     def testConcurrencyWithDisk(self):
         """
         Tests that the batch system is allocating disk resources properly
@@ -683,14 +742,15 @@ class SingleMachineBatchSystemJobTest(hidden.AbstractBatchSystemJobTest):
         # Physically, we're asking for 50% of disk and 50% of disk + 500bytes in the two jobs. The
         # batchsystem should not allow the 2 child jobs to run concurrently.
         root.addChild(Job.wrapFn(measureConcurrency, counterPath, self.sleepTime, cores=1,
-                                    memory='1M', disk=availableDisk/2))
+                                    memory='1M', disk=old_div(availableDisk,2)))
         root.addChild(Job.wrapFn(measureConcurrency, counterPath, self.sleepTime, cores=1,
-                                 memory='1M', disk=(availableDisk / 2) + 500))
+                                 memory='1M', disk=(old_div(availableDisk, 2)) + 500))
         Job.Runner.startToil(root, options)
         _, maxValue = getCounters(counterPath)
         self.assertEqual(maxValue, 1)
 
     @skipIf(SingleMachineBatchSystem.numCores < 4, 'Need at least four cores to run this test')
+    @slow
     def testNestedResourcesDoNotBlock(self):
         """
         Resources are requested in the order Memory > Cpu > Disk.
@@ -720,15 +780,15 @@ class SingleMachineBatchSystemJobTest(hidden.AbstractBatchSystemJobTest):
 
         # Should block off 50% of memory while waiting for it's 3 cores
         firstJobChild = Job.wrapFn(_resourceBlockTestAuxFn, outFile=outFile, sleepTime=0,
-                                   writeVal='fJC', cores=3, memory=int(availableMemory/2), disk='1M')
+                                   writeVal='fJC', cores=3, memory=int(old_div(availableMemory,2)), disk='1M')
 
         # These two shouldn't be able to run before B because there should be only
         # (50% of memory - 1M) available (firstJobChild should be blocking 50%)
         secondJobChild = Job.wrapFn(_resourceBlockTestAuxFn, outFile=outFile, sleepTime=5,
-                                    writeVal='sJC', cores=2, memory=int(availableMemory/1.5),
+                                    writeVal='sJC', cores=2, memory=int(old_div(availableMemory,1.5)),
                                     disk='1M')
         secondJobGrandChild = Job.wrapFn(_resourceBlockTestAuxFn, outFile=outFile, sleepTime=5,
-                                         writeVal='sJGC', cores=2, memory=int(availableMemory/1.5),
+                                         writeVal='sJGC', cores=2, memory=int(old_div(availableMemory,1.5)),
                                          disk='1M')
 
         root.addChild(blocker)
@@ -777,11 +837,17 @@ def _resourceBlockTestAuxFn(outFile, sleepTime, writeVal):
     time.sleep(sleepTime)
 
 
+@slow
 @needs_mesos
 class MesosBatchSystemJobTest(hidden.AbstractBatchSystemJobTest, MesosTestSupport):
     """
     Tests Toil workflow against the Mesos batch system
     """
+
+    def getOptions(self, tempDir):
+        options = super(MesosBatchSystemJobTest, self).getOptions(tempDir)
+        options.mesosMasterAddress = 'localhost:5050'
+        return options
 
     def getBatchSystemName(self):
         self._startMesos(self.cpuCount)
@@ -821,7 +887,7 @@ def count(delta, file_path):
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             s = os.read(fd, 10)
-            value, maxValue = map(int, s.split(','))
+            value, maxValue = list(map(int, s.split(',')))
             value += delta
             if value > maxValue: maxValue = value
             os.lseek(fd, 0, 0)
@@ -837,7 +903,7 @@ def count(delta, file_path):
 def getCounters(path):
     with open(path, 'r+') as f:
         s = f.read()
-        concurrentTasks, maxConcurrentTasks = map(int, s.split(','))
+        concurrentTasks, maxConcurrentTasks = list(map(int, s.split(',')))
     return concurrentTasks, maxConcurrentTasks
 
 

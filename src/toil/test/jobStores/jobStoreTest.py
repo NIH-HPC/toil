@@ -13,8 +13,20 @@
 # limitations under the License.
 
 from __future__ import absolute_import
+from __future__ import division
 
-import SocketServer
+from bd2k.util.retry import retry
+from future import standard_library
+from toil.lib.misc import truncExpBackoff
+
+standard_library.install_aliases()
+from builtins import next
+from builtins import range
+from builtins import str
+from past.utils import old_div
+from builtins import object
+import socketserver
+import pytest
 import hashlib
 import logging
 import threading
@@ -31,7 +43,7 @@ from unittest import skip
 
 # Python 3 compatibility imports
 from six.moves.queue import Queue
-from six.moves import xrange, socketserver as SocketServer, SimpleHTTPServer
+from six.moves import SimpleHTTPServer, StringIO
 from six import iteritems
 import six.moves.urllib.parse as urlparse
 from six.moves.urllib.request import urlopen, Request
@@ -43,11 +55,11 @@ from bd2k.util.exceptions import panic
 from mock import patch
 
 from toil.common import Config, Toil
+from toil.fileStore import FileID
 from toil.job import Job, JobNode
-from toil.jobStores.abstractJobStore import (AbstractJobStore,
-                                             NoSuchJobException,
+from toil.jobStores.abstractJobStore import (NoSuchJobException,
                                              NoSuchFileException)
-from toil.jobStores.aws.utils import region_to_bucket_location
+from toil.jobStores.googleJobStore import googleRetry
 from toil.jobStores.fileJobStore import FileJobStore
 from toil.test import (ToilTest,
                        needs_aws,
@@ -55,7 +67,8 @@ from toil.test import (ToilTest,
                        needs_encryption,
                        make_tests,
                        needs_google,
-                       experimental)
+                       slow)
+from future.utils import with_metaclass
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +77,14 @@ def tearDownModule():
     AbstractJobStoreTest.Test.cleanUpExternalStores()
 
 
-class AbstractJobStoreTest:
+class AbstractJobStoreTest(object):
     """
     Hide abstract base class from unittest's test case loader
 
     http://stackoverflow.com/questions/1323455/python-unit-test-with-base-and-sub-class#answer-25695512
     """
 
-    class Test(ToilTest):
-        __metaclass__ = ABCMeta
-
+    class Test(with_metaclass(ABCMeta, ToilTest)):
         @classmethod
         def setUpClass(cls):
             super(AbstractJobStoreTest.Test, cls).setUpClass()
@@ -361,12 +372,24 @@ class AbstractJobStoreTest:
             self.assertFalse(master.exists(jobOnMaster.jobStoreID))
             # TODO: Who deletes the shared files?
 
-
+        def testBatchCreate(self):
+            master = self.master
+            masterRequirements = dict(memory=12, cores=34, disk=35, preemptable=True)
+            jobGraphs = []
+            with master.batch():
+                for i in range(100):
+                    overlargeJobNodeOnMaster = JobNode(command='master-overlarge',
+                                        requirements=masterRequirements,
+                                        jobName='test-overlarge', unitName='onMaster',
+                                        jobStoreID=None, predecessorNumber=0)
+                    jobGraphs.append(master.create(overlargeJobNodeOnMaster))
+            for jobGraph in jobGraphs:
+                self.assertTrue(master.exists(jobGraph.jobStoreID))
 
         def _prepareTestFile(self, store, size=None):
             """
             Generates a URL that can be used to point at a test file in the storage mechanism
-            used by the job store under test by this class. Optionaly creates a file at that URL.
+            used by the job store under test by this class. Optionally creates a file at that URL.
 
             :param: store: an object referencing the store, same type as _createExternalStore's
                     return value
@@ -444,6 +467,7 @@ class AbstractJobStoreTest:
                 srcUrl, srcMd5 = other._prepareTestFile(store, size)
                 # Import into job store under test
                 jobStoreFileID = self.master.importFile(srcUrl)
+                self.assertTrue(isinstance(jobStoreFileID, FileID))
                 with self.master.readFileStream(jobStoreFileID) as f:
                     fileMD5 = hashlib.md5(f.read()).hexdigest()
                 self.assertEqual(fileMD5, srcMd5)
@@ -453,7 +477,7 @@ class AbstractJobStoreTest:
                 self.assertEqual(fileMD5, other._hashTestFile(dstUrl))
 
             make_tests(testImportExportFile,
-                       targetClass=cls,
+                       cls,
                        otherCls=activeTestClassesByName,
                        size=dict(zero=0,
                                  one=1,
@@ -482,11 +506,11 @@ class AbstractJobStoreTest:
                 self.assertEqual(fileMD5, srcMd5)
 
             make_tests(testImportSharedFile,
-                       targetClass=cls,
+                       cls,
                        otherCls=activeTestClassesByName)
 
         def testImportHttpFile(self):
-            http = SocketServer.TCPServer(('', 0), StubHttpRequestHandler)
+            http = socketserver.TCPServer(('', 0), StubHttpRequestHandler)
             try:
                 httpThread = threading.Thread(target=http.serve_forever)
                 httpThread.start()
@@ -514,6 +538,7 @@ class AbstractJobStoreTest:
             finally:
                 ftp.stop()
 
+        @slow
         def testFileDeletion(self):
             """
             Intended to cover the batch deletion of items in the AWSJobStore, but it doesn't hurt
@@ -523,12 +548,13 @@ class AbstractJobStoreTest:
             n = self._batchDeletionSize()
             for numFiles in (1, n - 1, n, n + 1, 2 * n):
                 job = master.create(self.arbitraryJob)
-                fileIDs = [master.getEmptyFileStoreID(job.jobStoreID) for _ in xrange(0, numFiles)]
+                fileIDs = [master.getEmptyFileStoreID(job.jobStoreID) for _ in range(0, numFiles)]
                 master.delete(job.jobStoreID)
                 for fileID in fileIDs:
                     # NB: the fooStream() methods return context managers
                     self.assertRaises(NoSuchFileException, master.readFileStream(fileID).__enter__)
 
+        @slow
         def testMultipartUploads(self):
             """
             This test is meant to cover multi-part uploads in the AWSJobStore but it doesn't hurt
@@ -625,12 +651,13 @@ class AbstractJobStoreTest:
                 self.assertEquals(f.read(), "")
             self.master.delete(job.jobStoreID)
 
+        @slow
         def testLargeFile(self):
             dirPath = self._createTempDir()
             filePath = os.path.join(dirPath, 'large')
             hashIn = hashlib.md5()
             with open(filePath, 'w') as f:
-                for i in xrange(0, 10):
+                for i in range(0, 10):
                     buf = os.urandom(self._partSize())
                     f.write(buf)
                     hashIn.update(buf)
@@ -657,6 +684,7 @@ class AbstractJobStoreTest:
                 except:
                     self.fail()
 
+        @slow
         def testCleanCache(self):
             # Make a bunch of jobs
             master = self.master
@@ -713,6 +741,25 @@ class AbstractJobStoreTest:
             # on the jobs iterator for certain cloud providers
             self.assertTrue(len(allJobs) <= 3001)
 
+        # NB: the 'thread' method seems to be needed here to actually
+        # ensure the timeout is raised, probably because the only
+        # "live" thread doesn't hold the GIL.
+        @pytest.mark.timeout(45, method='thread')
+        def testPartialReadFromStream(self):
+            """Test whether readFileStream will deadlock on a partial read."""
+            job = self.master.create(self.arbitraryJob)
+            with self.master.writeFileStream(job.jobStoreID) as (f, fileID):
+                # Write enough data to make sure the writer thread
+                # will get blocked on the write. Technically anything
+                # greater than the pipe buffer size plus the libc
+                # buffer size (64K + 4K(?))  should trigger this bug,
+                # but this gives us a lot of extra room just to be
+                # sure.
+                f.write('a' * 300000)
+            with self.master.readFileStream(fileID) as f:
+                self.assertEquals(f.read(1), "a")
+            # If it times out here, there's a deadlock
+
         @abstractmethod
         def _corruptJobStore(self):
             """
@@ -720,6 +767,7 @@ class AbstractJobStoreTest:
             """
             raise NotImplementedError()
 
+        @slow
         def testDestructionOfCorruptedJobStore(self):
             self._corruptJobStore()
             worker = self._createJobStore()
@@ -738,6 +786,16 @@ class AbstractJobStoreTest:
             cleaner = self._createJobStore()
             cleaner.destroy()
 
+        def testEmptyFileStoreIDIsReadable(self):
+            """Simply creates an empty fileStoreID and attempts to read from it."""
+            id = self.master.getEmptyFileStoreID()
+            fh, path = tempfile.mkstemp()
+            try:
+                self.master.readFile(id, path)
+                self.assertTrue(os.path.isfile(path))
+            finally:
+                os.unlink(path)
+
         def _largeLogEntrySize(self):
             """
             Sub-classes may want to override these in order to maximize test coverage
@@ -751,13 +809,12 @@ class AbstractJobStoreTest:
             return 5 * 1024 * 1024
 
 
-class AbstractEncryptedJobStoreTest:
+class AbstractEncryptedJobStoreTest(object):
     # noinspection PyAbstractClass
-    class Test(AbstractJobStoreTest.Test):
+    class Test(with_metaclass(ABCMeta, AbstractJobStoreTest.Test)):
         """
         A test of job stores that use encryption
         """
-        __metaclass__ = ABCMeta
 
         def setUp(self):
             # noinspection PyAttributeOutsideInit
@@ -784,6 +841,29 @@ class AbstractEncryptedJobStoreTest:
                 f.write("i am a fake key, so don't use me")
             config.cseKey = cseKeyFile
             return config
+
+        def testEncrypted(self):
+            """
+            Create an encrypted file. Read it in encrypted mode then try with encryption off
+            to ensure that it fails.
+            """
+            phrase = 'This file is encrypted.'
+            fileName = 'foo'
+            with self.master.writeSharedFileStream(fileName, isProtected=True) as f:
+                f.write(phrase)
+            with self.master.readSharedFileStream(fileName) as f:
+                self.assertEqual(phrase, f.read())
+
+            #disable encryption
+            self.master.config.sseKey = None
+            self.master.config.cseKey = None
+            try:
+                with self.master.readSharedFileStream(fileName) as f:
+                    self.assertEqual(phrase, f.read())
+            except AssertionError as e:
+                self.assertEqual("Content is encrypted but no key was provided.", e.message)
+            else:
+                self.fail("Read encryption content with encryption off.")
 
 
 class FileJobStoreTest(AbstractJobStoreTest.Test):
@@ -818,16 +898,26 @@ class FileJobStoreTest(AbstractJobStoreTest.Test):
     def _cleanUpExternalStore(self, dirPath):
         shutil.rmtree(dirPath)
 
+    def testPreserveFileName(self):
+        "Check that the fileID ends with the given file name."
+        fh, path = tempfile.mkstemp()
+        try:
+            os.close(fh)
+            job = self.master.create(self.arbitraryJob)
+            fileID = self.master.writeFile(path, job.jobStoreID)
+            self.assertTrue(fileID.endswith(os.path.basename(path)))
+        finally:
+            os.unlink(path)
 
-@experimental
+
 @needs_google
 class GoogleJobStoreTest(AbstractJobStoreTest.Test):
-    projectID = 'cgc-05-0006'
+    projectID = os.getenv('TOIL_GOOGLE_PROJECTID')
     headers = {"x-goog-project-id": projectID}
 
     def _createJobStore(self):
         from toil.jobStores.googleJobStore import GoogleJobStore
-        return GoogleJobStore.initialize(GoogleJobStoreTest.projectID + ":" + self.namePrefix)
+        return GoogleJobStore(GoogleJobStoreTest.projectID + ":" + self.namePrefix)
 
     def _corruptJobStore(self):
         # The Google job store has only one resource, the bucket, so we can't corrupt it without
@@ -835,47 +925,37 @@ class GoogleJobStoreTest(AbstractJobStoreTest.Test):
         pass
 
     def _prepareTestFile(self, bucket, size=None):
-        import boto
+        from toil.jobStores.googleJobStore import GoogleJobStore
         fileName = 'testfile_%s' % uuid.uuid4()
-        uri = 'gs://%s/%s' % (bucket.name, fileName)
-        if size:
-            with open('/dev/urandom', 'r') as readable:
-                boto.storage_uri(uri).set_contents_from_string(readable.read(size))
-        return uri
+        url = 'gs://%s/%s' % (bucket.name, fileName)
+        if size is None:
+            return url
+        with open('/dev/urandom', 'r') as readable:
+            contents = readable.read(size)
+        GoogleJobStore._writeToUrl(StringIO(contents), urlparse.urlparse(url))
+        return url, hashlib.md5(contents).hexdigest()
 
     def _hashTestFile(self, url):
-        import boto
         from toil.jobStores.googleJobStore import GoogleJobStore
-        projectID, uri = GoogleJobStore._getResources(urlparse.urlparse(url))
-        uri = boto.storage_uri(uri)
-        contents = uri.get_contents_as_string(headers=self.headers)
+        contents = GoogleJobStore._getBlobFromURL(urlparse.urlparse(url)).download_as_string()
         return hashlib.md5(contents).hexdigest()
 
+    @googleRetry
     def _createExternalStore(self):
-        import boto
-        from toil.jobStores.googleJobStore import GoogleJobStore
-        uriString = "gs://import-export-test-%s" % str(uuid.uuid4())
-        uri = boto.storage_uri(uriString)
-        return GoogleJobStore._retryCreateBucket(uri=uri, headers=self.headers)
+        from google.cloud import storage
+        bucketName = b"import-export-test-" + bytes(uuid.uuid4())
+        storageClient = storage.Client()
+        return storageClient.create_bucket(bucketName)
 
+    @googleRetry
     def _cleanUpExternalStore(self, bucket):
-        import boto
-        while True:
-            for key in bucket.list():
-                try:
-                    key.delete()
-                except boto.exception.GSResponseError as e:
-                    if e.status == 404:
-                        pass
-                    else:
-                        raise
-            try:
-                bucket.delete()
-            except boto.exception.GSResponseError as e:
-                if e.status == 404:
-                    break
-                else:
-                    continue
+        # this is copied from googleJobStore.destroy
+        try:
+            bucket.delete(force=True)
+            # throws ValueError if bucket has more than 256 objects. Then we must delete manually
+        except ValueError:
+            bucket.delete_blobs(bucket.list_blobs)
+            bucket.delete()
 
 
 @needs_aws
@@ -886,7 +966,7 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
         partSize = self._partSize()
         for encrypted in (True, False):
             self.assertTrue(AWSJobStore.FileInfo.maxInlinedSize(encrypted) < partSize)
-        return AWSJobStore(self.awsRegion()+ ':' + self.namePrefix, partSize=partSize)
+        return AWSJobStore(self.awsRegion() + ':' + self.namePrefix, partSize=partSize)
 
     def _corruptJobStore(self):
         from toil.jobStores.aws.jobStore import AWSJobStore
@@ -902,6 +982,7 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
         from boto.sdb import connect_to_region
         from boto.s3.connection import Location, S3Connection
         from toil.jobStores.aws.jobStore import BucketLocationConflictException
+        from toil.jobStores.aws.utils import retry_s3
         externalAWSLocation = Location.USWest
         for testRegion in 'us-east-1', 'us-west-2':
             # We run this test twice, once with the default s3 server us-east-1 as the test region
@@ -911,8 +992,10 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
             testJobStoreUUID = str(uuid.uuid4())
             # Create the nucket at the external region
             s3 = S3Connection()
-            bucket = s3.create_bucket('domain-test-' + testJobStoreUUID + '--files',
-                                      location=externalAWSLocation)
+            for attempt in retry_s3(delays=(2,5,10,30,60), timeout=600):
+                with attempt:
+                    bucket = s3.create_bucket('domain-test-' + testJobStoreUUID + '--files',
+                                              location=externalAWSLocation)
             options = Job.Runner.getDefaultOptions('aws:' + testRegion + ':domain-test-' +
                                                    testJobStoreUUID)
             options.logLevel = 'DEBUG'
@@ -935,14 +1018,17 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
             else:
                 self.fail()
             finally:
-                s3.delete_bucket(bucket=bucket)
+                for attempt in retry_s3():
+                    with attempt:
+                        s3.delete_bucket(bucket=bucket)
 
+    @slow
     def testInlinedFiles(self):
         from toil.jobStores.aws.jobStore import AWSJobStore
         master = self.master
         for encrypted in (True, False):
             n = AWSJobStore.FileInfo.maxInlinedSize(encrypted)
-            sizes = (1, n / 2, n - 1, n, n + 1, 2 * n)
+            sizes = (1, old_div(n, 2), n - 1, n, n + 1, 2 * n)
             for size in chain(sizes, islice(reversed(sizes), 1)):
                 s = os.urandom(size)
                 with master.writeSharedFileStream('foo') as f:
@@ -951,39 +1037,13 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
                     self.assertEqual(s, f.read())
 
     def testInaccessableLocation(self):
-        url = 's3://cgl-toil-tests-disallow-getbucketlocation/README'
+        url = 's3://toil-no-location-bucket-dont-delete/README'
         with patch('toil.jobStores.aws.jobStore.log') as mock_log:
             jobStoreID = self.master.importFile(url)
             self.assertTrue(self.master.fileExists(jobStoreID))
             args, kwargs = mock_log.warn.call_args
             self.assertTrue('Could not determine location' in args[0])
 
-    def testMultiPartImportFailures(self):
-        # This should be less than the number of threads in the pool used by the MP copy.
-        num_parts = 10
-        i = count()
-
-        # noinspection PyUnusedLocal
-        def fail(*args, **kwargs):
-            # The sleep ensures that all tasks are scheduled in the thread pool. Without it,
-            # there is a chance that one task fails before another is scheduled, causing the
-            # latter to bail out immediatly and failing the assertion that ensure the number of
-            # failing tasks.
-            time.sleep(.25)
-            if i.next() % 2 == 0:
-                raise RuntimeError()
-
-        with patch('boto.s3.multipart.MultiPartUpload.copy_part_from_key',
-                   new_callable=lambda: fail):
-            self.master.partSize = self.mpTestPartSize
-            bucket = self._externalStore()
-            url, md5 = self._prepareTestFile(bucket, self.mpTestPartSize * num_parts)
-            try:
-                self.master.importFile(url)
-            except RuntimeError as e:
-                self.assertEquals(e.message, 'Failed to copy at least %d part(s)' % (num_parts / 2))
-            else:
-                self.fail('Expected a RuntimeError to be raised')
     def testOverlargeJob(self):
         master = self.master
         masterRequirements = dict(memory=12, cores=34, disk=35, preemptable=True)
@@ -1022,6 +1082,7 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
 
     def _createExternalStore(self):
         import boto.s3
+        from toil.jobStores.aws.utils import region_to_bucket_location
         s3 = boto.s3.connect_to_region(self.awsRegion())
         try:
             return s3.create_bucket(bucket_name='import-export-test-%s' % uuid.uuid4(),
@@ -1065,7 +1126,7 @@ class InvalidAWSJobStoreTest(ToilTest):
 
 @needs_azure
 class AzureJobStoreTest(AbstractJobStoreTest.Test):
-    accountName = 'toiltest'
+    accountName = os.getenv('TOIL_AZURE_KEYNAME')
 
     def _createJobStore(self):
         from toil.jobStores.azureJobStore import AzureJobStore
@@ -1100,16 +1161,16 @@ class AzureJobStoreTest(AbstractJobStoreTest.Test):
 
     def _prepareTestFile(self, containerName, size=None):
         from toil.jobStores.azureJobStore import _fetchAzureAccountKey
-        from azure.storage.blob import BlobService
+        from azure.storage.blob.blockblobservice import BlockBlobService
 
         fileName = 'testfile_%s' % uuid.uuid4()
         url = 'wasb://%s@%s.blob.core.windows.net/%s' % (containerName, self.accountName, fileName)
         if size is None:
             return url
-        blobService = BlobService(account_key=_fetchAzureAccountKey(self.accountName),
-                                  account_name=self.accountName)
+        blobService = BlockBlobService(account_key=_fetchAzureAccountKey(self.accountName),
+                                       account_name=self.accountName)
         content = os.urandom(size)
-        blobService.put_block_blob_from_text(containerName, fileName, content)
+        blobService.create_blob_from_text(containerName, fileName, content)
         return url, hashlib.md5(content).hexdigest()
 
     def _hashTestFile(self, url):
@@ -1118,24 +1179,24 @@ class AzureJobStoreTest(AbstractJobStoreTest.Test):
         blob = AzureJobStore._parseWasbUrl(url)
         for attempt in retry_azure():
             with attempt:
-                content = blob.service.get_blob_to_bytes(blob.container, blob.name)
-                return hashlib.md5(content).hexdigest()
+                blob = blob.service.get_blob_to_bytes(blob.container, blob.name)
+                return hashlib.md5(blob.content).hexdigest()
 
     def _createExternalStore(self):
         from toil.jobStores.azureJobStore import _fetchAzureAccountKey
-        from azure.storage.blob import BlobService
+        from azure.storage.blob.blockblobservice import BlockBlobService
 
-        blobService = BlobService(account_key=_fetchAzureAccountKey(self.accountName),
-                                  account_name=self.accountName)
+        blobService = BlockBlobService(account_key=_fetchAzureAccountKey(self.accountName),
+                                       account_name=self.accountName)
         containerName = 'import-export-test-%s' % uuid.uuid4()
         blobService.create_container(containerName)
         return containerName
 
     def _cleanUpExternalStore(self, containerName):
         from toil.jobStores.azureJobStore import _fetchAzureAccountKey
-        from azure.storage.blob import BlobService
-        blobService = BlobService(account_key=_fetchAzureAccountKey(self.accountName),
-                                  account_name=self.accountName)
+        from azure.storage.blob.blockblobservice import BlockBlobService
+        blobService = BlockBlobService(account_key=_fetchAzureAccountKey(self.accountName),
+                                       account_name=self.accountName)
         blobService.delete_container(containerName)
 
 
@@ -1153,20 +1214,23 @@ class InvalidAzureJobStoreTest(ToilTest):
                           AzureJobStore,
                           'toiltest:a_b')
 
-
-class EncryptedFileJobStoreTest(FileJobStoreTest, AbstractEncryptedJobStoreTest.Test):
-    pass
-
-
 @needs_aws
 @needs_encryption
+@slow
 class EncryptedAWSJobStoreTest(AWSJobStoreTest, AbstractEncryptedJobStoreTest.Test):
     pass
 
 
 @needs_azure
 @needs_encryption
+@slow
 class EncryptedAzureJobStoreTest(AzureJobStoreTest, AbstractEncryptedJobStoreTest.Test):
+    pass
+
+@needs_google
+@needs_encryption
+@slow
+class EncryptedGoogleJobStoreTest(AzureJobStoreTest, AbstractEncryptedJobStoreTest.Test):
     pass
 
 
